@@ -1,0 +1,16 @@
+# /etc/rebar-arm.conf — sourced by rebar-arm.sh (bash syntax).
+# The systemd unit only runs when this file exists.
+
+# Cards to arm, full PCI addresses, space-separated. Find them with: lspci -D -d 10de: -nn
+# Leave the console (boot_vga = 1) card out for the first reboot; add it only after a manual run worked on it.
+REBAR_BDFS="0000:01:00.0"
+
+# vendor:device pairs the script may touch. Only 10de:2206 (GA102, RTX 3080) is verified.
+REBAR_IDS="10de:2206"
+
+# BAR1 size = 64 MiB << REBAR_N, n = ceil(log2(VRAM / 64 MiB)). rebar-check.sh --vram SIZE suggests it.
+# 9 (32 GiB) is the only value verified, on the RTX 3080 20GB. Any other value is predicted, not tested.
+# Not derived at boot: the driver is not loaded yet, so the VRAM size is not available then.
+REBAR_N=9
+
+REBAR_LOG=/var/log/rebar-arm.log

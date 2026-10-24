@@ -1,0 +1,17 @@
+[Unit]
+Description=Arm GA102 BAR1 size override before the GPU driver binds
+DefaultDependencies=no
+After=systemd-journald.socket
+Before=systemd-modules-load.service
+ConditionPathExists=/etc/rebar-arm.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rebar-arm.sh
+RemainAfterExit=yes
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target
