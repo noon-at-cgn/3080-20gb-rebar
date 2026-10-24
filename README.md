@@ -31,6 +31,32 @@ untested. Stock cards with NVIDIA's own ReBAR vBIOS update do not need this.
 - The NVIDIA driver loads from the root file system, after the service runs (not from the initramfs).
 - A machine where a GPU or host hang is acceptable while you try it.
 
+## How it works
+
+The CPU reaches a GPU's memory through a PCI memory window called BAR1. A stock RTX 3080 20GB gets a 256 MiB
+window, so only a small slice of the 20 GB is visible at any moment and larger host-visible allocations fail.
+A bigger window is normally called Resizable BAR, and it has traditionally needed a new vBIOS, because the
+vBIOS decides which window sizes the card offers. Flashing is risky, and NVIDIA does not publish a ReBAR vBIOS
+for these memory-modded boards. This project skips the vBIOS: the operating system asks the card for the larger
+window at boot, in three steps.
+
+1. **Make the card offer 32 GiB.** GA102 has a frame-buffer size override in PCI config space at `0x610`. Writing
+   `00001c81` sets its enable bit (bit 11) and a size field of 9 (bits 10:7), meaning 64 MiB << 9 = 32 GiB. The
+   card's Resizable BAR capability (`0xbbc`) then lists sizes up to 32 GiB instead of 256 MiB (`00001c00` becomes
+   `000ffc00`). This is a config write, not a flash write. Nothing is stored on the card, so a power-off or reboot
+   returns it to stock, and the boot service writes it again.
+2. **Resize BAR1 while no driver is attached.** The kernel can only move and resize a BAR when no driver owns
+   the device, so the service runs before the NVIDIA driver loads. It writes size index 15 (1 MiB << 15 = 32 GiB)
+   to the card's `resource1_resize` file in sysfs, and the kernel re-assigns BAR1 inside the 32 GiB 64-bit
+   window. That needs Above-4G decoding and enough 64-bit MMIO space under the card's PCIe bridge.
+3. **Stop the driver from over-reserving it.** With a large BAR the NVIDIA driver switches to "static BAR1": it
+   maps VRAM into BAR1 up front and counts host-visible memory twice against it, so only about half of VRAM
+   (about 10 GiB) can be allocated for CPU access. Setting `RMForceStaticBar1=0` for the card (installed by
+   `install.sh`) returns to on-demand mapping, and about 98 % of VRAM becomes reachable.
+
+The vBIOS and flash are never written, and the card still reports 20 GB. What changes is how much of that memory
+the CPU can reach directly.
+
 ## Quick start
 
 ```sh
