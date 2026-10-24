@@ -1,4 +1,4 @@
-# 3080-20gb-rebar: 32 GiB BAR1 on the memory-modded RTX 3080 20GB without flashing
+# 3080-20gb-rebar: 32 GiB BAR1 on the memory-modded RTX 3080 20GB without flashing the vBIOS
 
 For the memory-modded RTX 3080 20GB. On GA102, PCI config dword `0x610` holds a frame-buffer size override.
 Writing `00001c81` to it makes the GPU advertise a 32 GiB BAR1 (`0xbbc` reads `000ffc00`), and the kernel's sysfs
