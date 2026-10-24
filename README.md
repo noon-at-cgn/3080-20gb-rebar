@@ -60,10 +60,14 @@ the CPU can reach directly.
 ## Quick start
 
 ```sh
+lspci -D -d 10de:2206                             # find your card's address, for example 0000:01:00.0
 sudo scripts/rebar-check.sh --vram 20G            # read-only; must report that the preconditions hold
-sudo ./install.sh --bdfs "0000:01:00.0" --enable  # writes /etc/rebar-arm.conf, the script, the unit and the driver option
+sudo ./install.sh --bdfs "<address>" --enable     # writes /etc/rebar-arm.conf, the script, unit and driver option
 sudo reboot
 ```
+
+Use the address of your own card from the first command. Without `--bdfs`, `install.sh` lists the cards it finds
+and asks which to arm.
 
 For the verified card the installer also sets the NVIDIA driver option that makes all of VRAM reachable through
 BAR1 (next section). `install.sh` leaves out the card that drives the display unless you pass
