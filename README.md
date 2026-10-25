@@ -109,9 +109,7 @@ options nvidia NVreg_RegistryDwordsPerDevice="pci=0000:01:00.0;RMForceStaticBar1
 With the 32 GiB BAR1 and `RMForceStaticBar1=0` from this repo in place, two or more of these cards can copy directly
 to each other (peer-to-peer) with the patched NVIDIA open kernel modules in
 [3080-20g-p2p](https://github.com/noon-at-cgn/3080-20g-p2p). On the tested pair it measured 10.27 GB/s one way
-(5.78 GB/s without P2P) and made vLLM tensor-parallel prefill 6-10 % faster. That repo is a separate, experimental
-driver patch with its own requirements and disclaimer. It reads the per-card line above; keep any extra per-card keys
-in that same line, and re-add them if you reinstall this repo, because `install.sh` rewrites the file.
+(5.78 GB/s without P2P) and made vLLM tensor-parallel prefill 6-10 % faster.
 
 ## Results
 
