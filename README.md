@@ -69,6 +69,10 @@ sudo reboot
 Use the address of your own card from the first command; the ID in brackets should match *Tested on*. Without
 `--bdfs`, `install.sh` lists the cards it finds and asks which to arm.
 
+**Several cards:** separate the addresses with spaces inside one pair of quotes, never commas:
+`--bdfs "0000:01:00.0 0000:02:00.0"`. `/etc/rebar-arm.conf` (`REBAR_BDFS`) uses the same format. The driver line in
+the next section uses semicolons instead (`pci=<address>;RMForceStaticBar1=0;` per card); `install.sh` writes it.
+
 For the verified card the installer also sets the NVIDIA driver option that makes all of VRAM reachable through
 BAR1 (next section). `install.sh` leaves out the card that drives the display unless you pass
 `--include-console`; arm that card by hand once first (*Manual procedure*). `./install.sh --help` lists the other
