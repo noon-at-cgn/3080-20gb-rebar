@@ -69,7 +69,7 @@ sudo reboot
 Use the address of your own card from the first command; the ID in brackets should match *Tested on*. Without
 `--bdfs`, `install.sh` lists the cards it finds and asks which to arm.
 
-**Several cards:** separate the addresses with spaces inside one pair of quotes, never commas:
+**Several cards:** separate the addresses with spaces inside one pair of quotes, not commas:
 `--bdfs "0000:01:00.0 0000:02:00.0"`. `/etc/rebar-arm.conf` (`REBAR_BDFS`) uses the same format. The driver line in
 the next section uses semicolons instead (`pci=<address>;RMForceStaticBar1=0;` per card); `install.sh` writes it.
 
@@ -142,7 +142,7 @@ Test commands: `results/README.md`.
    `echo 1 > /sys/class/vtconsole/vtcon1/bind`.
 
 **Rollback without a reboot:** steps 1-3, then shrink first, `echo 8 > /sys/bus/pci/devices/$BDF/resource1_resize`,
-and only then `setpci -s $BDF 0x610.L=00001001:00000f80`; rebind and reattach the console. Never disarm `0x610`
+and only then `setpci -s $BDF 0x610.L=00001001:00000f80`; rebind and reattach the console. Do not disarm `0x610`
 while BAR1 is still 32 GiB.
 
 ## Uninstall and rollback
