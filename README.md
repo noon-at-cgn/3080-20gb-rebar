@@ -6,6 +6,9 @@ ReBAR interface then resizes BAR1 to 32 GiB before the NVIDIA driver binds. Noth
 change is volatile (gone at power-off), so a small systemd service re-applies it at every boot. Reported VRAM is
 unchanged.
 
+> **Have a memory-modded RTX 4090 / 4090D 48GB and want a 64 GiB BAR1?** This method may work for you too; see
+> [Help wanted: RTX 4090 / 4090D 48GB](#help-wanted-rtx-4090--4090d-48gb-64-gib-bar1).
+
 ## Disclaimer
 
 **Use at your own risk.** This project is provided as is, without warranty of any kind, under the MIT licence
