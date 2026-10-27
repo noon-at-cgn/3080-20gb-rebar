@@ -174,6 +174,24 @@ against stand-ins and on healthy cards.
 Run `sudo scripts/rebar-check.sh --vram <SIZE>` (read-only) and open an issue with the *Compatibility report*
 template, including its output.
 
+### Help wanted: RTX 4090 / 4090D 48GB (64 GiB BAR1)
+
+The memory-modded 48GB 4090 and 4090D cap BAR1 at 32 GiB, less than their VRAM. Their vBIOS uses the same `0x610`
+register as the 3080, and NVIDIA's own 48GB AD102 cards (L40S, RTX 6000 Ada) ship with 64 GiB. Whether AD102
+accepts the write from the host is untested. If you have one on Linux, run this as root with the card idle and not
+driving the display (a power-off undoes it; nothing is flashed):
+
+```sh
+BDF=0000:01:00.0                                  # your card, from lspci -Dnn -d 10de::0300
+setpci -s $BDF 0x60c.L 0x610.L 0xbbc.L 0xdcc.L
+echo $BDF > /sys/bus/pci/drivers/nvidia/unbind
+setpci -s $BDF 0x610.L=00000d00:00000f80          # size field 10 = 64 GiB
+setpci -s $BDF 0x610.L 0xbbc.L                    # works if: 00001d01 001ffc00
+echo $BDF > /sys/bus/pci/drivers/nvidia/bind
+```
+
+Open an issue with all the output, `lspci -nn`, the vBIOS version and the board.
+
 ## Licence
 
 MIT, see `LICENSE`.
