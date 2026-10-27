@@ -193,7 +193,20 @@ setpci -s $BDF 0x610.L 0xbbc.L                    # works if: 00001d01 001ffc00
 echo $BDF > /sys/bus/pci/drivers/nvidia/bind
 ```
 
-Open an issue with all the output, `lspci -nn`, the vBIOS version and the board.
+If the last read shows `00001d01 001ffc00`, an optional second step resizes BAR1 to 64 GiB (also untested):
+
+```sh
+echo $BDF > /sys/bus/pci/drivers/nvidia/unbind
+echo 16 > /sys/bus/pci/devices/$BDF/resource1_resize   # 16 = 64 GiB; "No space left" = address window too small
+lspci -vv -s $BDF | grep 'Region 1'                     # expect [size=64G]
+# if anything looks wrong, before rebinding: echo 15 > /sys/bus/pci/devices/$BDF/resource1_resize
+echo $BDF > /sys/bus/pci/drivers/nvidia/bind
+nvidia-smi -q -d MEMORY | grep -A1 BAR1                  # expect Total 65536 MiB
+```
+
+Each card needs about 128 GiB of free 64-bit address space for this. To keep it across reboots,
+`install.sh --n 10 --force` arms it at every boot (untested). Open an issue with all the output, `lspci -nn`, the vBIOS
+version and the board, whether it worked or not.
 
 ## Licence
 
