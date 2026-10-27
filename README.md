@@ -204,9 +204,10 @@ echo $BDF > /sys/bus/pci/drivers/nvidia/bind
 nvidia-smi -q -d MEMORY | grep -A1 BAR1                  # expect Total 65536 MiB
 ```
 
-Each card needs about 128 GiB of free 64-bit address space for this. To keep it across reboots,
-`install.sh --n 10 --force` arms it at every boot (untested). Open an issue with all the output, `lspci -nn`, the vBIOS
-version and the board, whether it worked or not.
+The slot needs room for a 64 GiB-aligned BAR1 in the 64-bit address space (Above 4G Decoding on); if there isn't, the
+resize fails with "No space left on device". To keep it across reboots,
+`install.sh --n 10 --force --lift-ceiling --enable` arms it at every boot and sets the driver option (untested). Open
+an issue with all the output, `lspci -nn`, the vBIOS version and the board, whether it worked or not.
 
 ## Licence
 
