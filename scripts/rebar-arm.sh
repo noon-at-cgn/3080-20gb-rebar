@@ -9,8 +9,9 @@
 # Run before the GPU driver binds (the systemd unit orders it before systemd-modules-load).
 # Idempotent: 0x610 is written only if bits 11:7 differ from the target, and BAR1 is resized only if its
 # current length (from the device's sysfs `resource` file) differs from 64 MiB << REBAR_N.
-# Never fatal: a failure is logged and the card stays at whatever size it has. If the resize fails (the kernel
-# could not fit BAR1), 0x610 is restored to its value before the run, so the capability matches the real BAR1.
+# Never fatal: a failure is logged and the card stays at whatever size it has. If BAR1 does not end up at the target
+# size (the kernel could not fit it, or the write reported success but BAR1 kept its size), 0x610 is restored to its
+# value before the run, so the capability matches the real BAR1.
 # Log: every line goes to stdout (the journal under systemd) first; appending to REBAR_LOG is best-effort,
 # because at early boot the root file system can still be read-only. At boot, `journalctl -u rebar-arm` is
 # the authoritative log.
@@ -105,18 +106,24 @@ for bdf in $REBAR_BDFS; do
 	if [ $(((0x$mask >> IDX) & 1)) != 1 ]; then
 		log "$bdf resize mask not widened ($mask), skip resize"; continue
 	fi
-	if echo "$IDX" >"$dev/resource1_resize" 2>/dev/null; then
-		log "$bdf armed and resized to $SIZE"
-	else
-		len=$(bar1_len "$dev")
-		if [ "$len" = "$BYTES" ]; then
-			log "$bdf armed; resize write failed but BAR1 is $SIZE, left armed"
-		elif setpci -s "$bdf" "0x610.L=$(printf '%08x:%08x' "$restore" "$MASK")" &&
-			[ $((0x$(setpci -s "$bdf" 0x610.L) & MASK)) = "$restore" ] && ! cap_wide "$bdf"; then
-			log "$bdf resize failed (kernel could not fit BAR1, see dmesg); disarmed, left at stock $((${len:-0} >> 20)) MiB"
+	wrote=1
+	echo "$IDX" >"$dev/resource1_resize" 2>/dev/null || wrote=0
+	len=$(bar1_len "$dev")
+	if [ "$len" = "$BYTES" ]; then
+		if [ "$wrote" = 1 ]; then
+			log "$bdf armed and resized to $SIZE"
 		else
-			log "$bdf resize failed and disarm failed (0x610=$(setpci -s "$bdf" 0x610.L 2>/dev/null), 0xbbc=$(setpci -s "$bdf" 0xbbc.L 2>/dev/null))"
+			log "$bdf armed; resize write failed but BAR1 is $SIZE, left armed"
 		fi
+	elif setpci -s "$bdf" "0x610.L=$(printf '%08x:%08x' "$restore" "$MASK")" &&
+		[ $((0x$(setpci -s "$bdf" 0x610.L) & MASK)) = "$restore" ] && ! cap_wide "$bdf"; then
+		if [ "$wrote" = 1 ]; then
+			log "$bdf resize reported success but BAR1 is $((${len:-0} >> 20)) MiB; disarmed"
+		else
+			log "$bdf resize failed (kernel could not fit BAR1, see dmesg); disarmed, left at stock $((${len:-0} >> 20)) MiB"
+		fi
+	else
+		log "$bdf resize failed and disarm failed (0x610=$(setpci -s "$bdf" 0x610.L 2>/dev/null), 0xbbc=$(setpci -s "$bdf" 0xbbc.L 2>/dev/null))"
 	fi
 done
 exit 0
