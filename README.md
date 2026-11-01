@@ -177,7 +177,7 @@ against stand-ins and on healthy cards.
 | Unbind hangs or the screen goes blank on the display card | Detach the console first (step 2). `install.sh` leaves this card out unless `--include-console`. |
 | Host-visible allocations fail at about half of VRAM | The driver option is missing: check `/etc/modprobe.d/zz-nvidia-static-bar1.conf` lists the card (installed by default for the verified card, `--lift-ceiling` for others), then reboot. |
 | CPU writes through BAR1 drop to 5 or 2.4 GB/s on an idle GPU | The idle GPU lowers its PCIe link speed. With persistence mode on (`nvidia-smi -pm 1`), lock the memory clock around large uploads: `nvidia-smi -i <BDF> -lmc <max>,<max>`, then `-rmc`. |
-| Journal says `armed but resize failed`; `lspci` shows `[size=256M]` | Linux could not fit the 32 GiB BAR1, usually because the card sits behind a PCIe switch whose window the firmware sized for 256 MiB (`dmesg` shows `cannot fit ... required for`). The service then undoes the arming, so the card runs as stock. Switch setups are not supported yet. |
+| Journal says `resize failed ... disarmed` (older versions: `armed but resize failed`); `lspci` shows `[size=256M]` | Linux could not fit the 32 GiB BAR1, usually because the card sits behind a PCIe switch whose window the firmware sized for 256 MiB (`dmesg` shows `cannot fit ... required for`). The service undoes the arming, so the card runs as stock. Older versions left it armed: update and reboot. Switch setups are not supported yet. |
 
 ## Reporting compatibility
 
