@@ -50,6 +50,12 @@ suggest_n() {
 	echo "$n"
 }
 bit() { echo $(((0x$1 >> $2) & 1)); }
+# largest size advertised in the ReBAR capability register (0xbbc bit k = 1 MiB << (k - 4)), in MiB
+cap_max_mib() {
+	local k m=0
+	for k in $(seq 4 31); do [ "$(bit "$1" "$k")" = 1 ] && m=$((1 << (k - 4))); done
+	echo "$m"
+}
 
 FAIL=0
 for bdf in "${BDFS[@]}"; do
@@ -57,7 +63,7 @@ for bdf in "${BDFS[@]}"; do
 	dev=/sys/bus/pci/devices/$bdf
 	echo "== $bdf"
 	if [ ! -e "$dev" ]; then echo "  FAIL device not present"; FAIL=1; continue; fi
-	bad=0 untested=0
+	bad=0 untested=0 stuck=0
 	ok() { echo "  ok    $*"; }
 	no() { echo "  FAIL  $*"; bad=1; }
 	unv() { echo "  note  $*"; untested=1; }
@@ -91,6 +97,11 @@ for bdf in "${BDFS[@]}"; do
 	rbc0=$(setpci -s "$bdf" 0xbc0.L 2>/dev/null) || rbc0=""
 	echo "  0x600 ${vsec:-?} 0x604 ${vhdr:-?} 0x60c ${r60c:-?} 0x610 ${r610:-?}"
 	echo "  0xbb0 ${rbb0:-?} 0xbbc ${rbbc:-?} 0xbc0 ${rbc0:-?} resource1_resize $(cat "$dev/resource1_resize" 2>/dev/null || echo absent)"
+	bar1="" bar1_mib=""
+	if read -r start end _ < <(sed -n 2p "$dev/resource" 2>/dev/null) && [ -n "$start" ]; then
+		bar1="$start..$end" bar1_mib=$(((end - start + 1) >> 20))
+	fi
+	echo "  BAR1 ${bar1_mib:-?} MiB (${bar1:-resource unreadable}), advertised max $([ -n "$rbbc" ] && echo "$(cap_max_mib "$rbbc") MiB" || echo ?)"
 
 	if [ -n "$vsec" ] && [ $((0x$vsec & 0xffff)) = $((0x000b)) ] && [ -n "$vhdr" ] && [ $((0x$vhdr & 0xffff)) = 1 ]; then
 		ok "vendor-specific capability (ID 0001) at 0x600"
@@ -99,7 +110,11 @@ for bdf in "${BDFS[@]}"; do
 	else no "0x60c bit 11 FB_SIZE_OVERRIDE not set"; fi
 	if [ -n "$r610" ]; then
 		if [ "$(bit "$r610" 11)" = 1 ]; then
-			ok "0x610 override already armed, VAL $(((0x$r610 >> 7) & 0xf)) ($((64 << ((0x$r610 >> 7) & 0xf))) MiB)"
+			target=$((64 << ((0x$r610 >> 7) & 0xf)))
+			ok "0x610 override already armed, VAL $(((0x$r610 >> 7) & 0xf)) ($target MiB)"
+			if [ -z "$bar1_mib" ]; then no "0x610 armed but the BAR1 size is unreadable"
+			elif [ "$bar1_mib" = "$target" ]; then ok "0x610 armed and BAR1 is $bar1_mib MiB"
+			else no "0x610 armed but BAR1 is $bar1_mib MiB, not $target MiB: the resize did not happen (kernel could not fit it; see dmesg)"; stuck=1; fi
 		else ok "0x610 override disarmed (stock on the verified card: 00001001)"; fi
 	else no "0x610 unreadable"; fi
 	if [ -n "$rbb0" ] && [ $((0x$rbb0 & 0xffff)) = $((0x0015)) ]; then ok "Resizable BAR capability at 0xbb0"
@@ -109,7 +124,8 @@ for bdf in "${BDFS[@]}"; do
 	if [ -e "$dev/resource1_resize" ]; then ok "kernel exposes resource1_resize"
 	else no "kernel has no resource1_resize (needs sysfs BAR resize support)"; fi
 
-	if [ "$bad" = 1 ]; then echo "  VERDICT preconditions do NOT hold"; FAIL=1
+	if [ "$stuck" = 1 ]; then echo "  VERDICT 0x610 armed but BAR1 was NOT resized: the driver and the hardware disagree on BAR1"; FAIL=1
+	elif [ "$bad" = 1 ]; then echo "  VERDICT preconditions do NOT hold"; FAIL=1
 	elif [ "$untested" = 1 ]; then echo "  VERDICT preconditions hold, but this is not the verified configuration (untested)"
 	else echo "  VERDICT preconditions hold on the verified configuration"; fi
 	if [ "$drv" = nvidia ] && command -v nvidia-smi >/dev/null; then

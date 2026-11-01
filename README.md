@@ -30,7 +30,10 @@ untested. Stock cards with NVIDIA's own ReBAR vBIOS update do not need this.
 
 - Root, `pciutils` (`setpci`, `lspci`), systemd.
 - A kernel that exposes `/sys/bus/pci/devices/<BDF>/resource1_resize`.
-- Above-4G decoding and enough 64-bit MMIO space for a 32 GiB BAR per card.
+- Above-4G decoding and room for each card's 32 GiB BAR1 in the 64-bit address space.
+- Cards directly on CPU root ports. Cards behind PCIe switches (for example PLX in multi-GPU servers) are not
+  supported yet: the firmware sizes the switch windows for 256 MiB BARs and Linux cannot grow them at runtime, so
+  the resize fails (see *Troubleshooting*).
 - The NVIDIA driver loads from the root file system, after the service runs (not from the initramfs).
 - A machine where a GPU or host hang is acceptable while you try it.
 
@@ -85,10 +88,13 @@ options (`--dry-run`, `--root DIR`, `--no-lift-ceiling`).
 
 ```sh
 journalctl -b -u rebar-arm                     # <BDF> armed and resized to 32768 MiB
+lspci -vv -s <BDF> | grep "Region 1"           # [size=32G]: the real BAR1 size, the check that counts
 sudo setpci -s <BDF> 0x610.L 0xbbc.L           # 00001c81, 000ffc00
-lspci -vv -s <BDF> | grep "Region 1"           # [size=32G]
-nvidia-smi -q -d MEMORY | grep -A1 BAR1        # Total 32768 MiB
+sudo scripts/rebar-check.sh                    # also compares the real BAR1 size with the advertised one
 ```
+
+Do not rely on `nvidia-smi` for this: its *BAR1 Total* follows the size the card advertises, so it can show
+32768 MiB while the real BAR1 is still 256 MiB.
 
 Deeper checks (pattern test through the aperture, CUDA control) are in `verify/README.md`.
 
@@ -171,6 +177,7 @@ against stand-ins and on healthy cards.
 | Unbind hangs or the screen goes blank on the display card | Detach the console first (step 2). `install.sh` leaves this card out unless `--include-console`. |
 | Host-visible allocations fail at about half of VRAM | The driver option is missing: check `/etc/modprobe.d/zz-nvidia-static-bar1.conf` lists the card (installed by default for the verified card, `--lift-ceiling` for others), then reboot. |
 | CPU writes through BAR1 drop to 5 or 2.4 GB/s on an idle GPU | The idle GPU lowers its PCIe link speed. With persistence mode on (`nvidia-smi -pm 1`), lock the memory clock around large uploads: `nvidia-smi -i <BDF> -lmc <max>,<max>`, then `-rmc`. |
+| Journal says `armed but resize failed`; `lspci` shows `[size=256M]` | Linux could not fit the 32 GiB BAR1, usually because the card sits behind a PCIe switch whose window the firmware sized for 256 MiB (`dmesg` shows `cannot fit ... required for`). The service then undoes the arming, so the card runs as stock. Switch setups are not supported yet. |
 
 ## Reporting compatibility
 

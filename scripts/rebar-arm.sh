@@ -9,13 +9,15 @@
 # Run before the GPU driver binds (the systemd unit orders it before systemd-modules-load).
 # Idempotent: 0x610 is written only if bits 11:7 differ from the target, and BAR1 is resized only if its
 # current length (from the device's sysfs `resource` file) differs from 64 MiB << REBAR_N.
-# Never fatal: a failure is logged and the card stays at whatever size it has.
+# Never fatal: a failure is logged and the card stays at whatever size it has. If the resize fails (the kernel
+# could not fit BAR1), 0x610 is restored to its value before the run, so the capability matches the real BAR1.
 # Log: every line goes to stdout (the journal under systemd) first; appending to REBAR_LOG is best-effort,
 # because at early boot the root file system can still be read-only. At boot, `journalctl -u rebar-arm` is
 # the authoritative log.
 #
 # --repair: for cards that are already bound and may already have a wide BAR1. Re-arms the
-# field only after a reset (FLR / driver recovery) cleared it. Never resizes, never unbinds.
+# field only after a reset (FLR / driver recovery) cleared it, and only if BAR1 already has the
+# target size. Never resizes, never unbinds.
 set -u
 
 CONF=${REBAR_ARM_CONF:-/etc/rebar-arm.conf}
@@ -55,6 +57,7 @@ BYTES=$((64 << (REBAR_N + 20)))
 
 armed() { [ $((0x$(setpci -s "$1" 0x610.L) & MASK)) = "$FIELD" ]; }
 cap_wide() { [ $(((0x$(setpci -s "$1" 0xbbc.L) >> CAP_BIT) & 1)) = 1 ]; }
+bar1_len() { local start end; read -r start end _ < <(sed -n 2p "$1/resource" 2>/dev/null) && echo $((end - start + 1)); }
 
 for bdf in $REBAR_BDFS; do
 	case $bdf in ????:*) ;; *) bdf=0000:$bdf ;; esac
@@ -68,7 +71,10 @@ for bdf in $REBAR_BDFS; do
 	esac
 	if [ -e "$dev/driver" ]; then
 		if [ "$REPAIR" = 1 ] && ! cap_wide "$bdf"; then
-			if setpci -s "$bdf" "0x610.L=$SET" && cap_wide "$bdf"; then
+			len=$(bar1_len "$dev")
+			if [ "$len" != "$BYTES" ]; then
+				log "$bdf bound with BAR1 $((${len:-0} >> 20)) MiB, not the target; --repair skips (would leave the driver and the hardware out of step)"
+			elif setpci -s "$bdf" "0x610.L=$SET" && cap_wide "$bdf"; then
 				log "$bdf bound; re-armed after reset, 0xbbc now $(setpci -s "$bdf" 0xbbc.L)"
 			else
 				log "$bdf bound; re-arm after reset failed (0x610=$(setpci -s "$bdf" 0x610.L 2>/dev/null), 0xbbc=$(setpci -s "$bdf" 0xbbc.L 2>/dev/null))"
@@ -80,7 +86,9 @@ for bdf in $REBAR_BDFS; do
 	fi
 	if [ "$REPAIR" = 1 ]; then log "$bdf not bound; --repair only touches bound cards, skip"; continue; fi
 
-	setpci -s "$bdf" 0x610.L >/dev/null 2>&1 || { log "$bdf 0x610 unreadable"; continue; }
+	prev=$(setpci -s "$bdf" 0x610.L 2>/dev/null) || { log "$bdf 0x610 unreadable"; continue; }
+	restore=$((0x$prev & MASK))          # bits 11:7 before this run; stock on the verified card: 0 (EN=0 VAL=0)
+	[ "$restore" = "$FIELD" ] && restore=0 # already armed by an earlier run: back off to stock
 	if ! armed "$bdf"; then
 		setpci -s "$bdf" "0x610.L=$SET" || { log "$bdf 0x610 write failed"; continue; }
 	fi
@@ -90,8 +98,7 @@ for bdf in $REBAR_BDFS; do
 	if ! cap_wide "$bdf"; then
 		log "$bdf capability did not widen (0xbbc=$(setpci -s "$bdf" 0xbbc.L)), skip resize"; continue
 	fi
-	read -r start end _ < <(sed -n 2p "$dev/resource" 2>/dev/null) || start=""
-	if [ -n "$start" ] && [ $((end - start + 1)) = "$BYTES" ]; then
+	if [ "$(bar1_len "$dev")" = "$BYTES" ]; then
 		log "$bdf already armed and resized ($SIZE), skip"; continue
 	fi
 	mask=$(cat "$dev/resource1_resize" 2>/dev/null) || mask=0
@@ -101,7 +108,15 @@ for bdf in $REBAR_BDFS; do
 	if echo "$IDX" >"$dev/resource1_resize" 2>/dev/null; then
 		log "$bdf armed and resized to $SIZE"
 	else
-		log "$bdf armed but resize failed; left at current size"
+		len=$(bar1_len "$dev")
+		if [ "$len" = "$BYTES" ]; then
+			log "$bdf armed; resize write failed but BAR1 is $SIZE, left armed"
+		elif setpci -s "$bdf" "0x610.L=$(printf '%08x:%08x' "$restore" "$MASK")" &&
+			[ $((0x$(setpci -s "$bdf" 0x610.L) & MASK)) = "$restore" ] && ! cap_wide "$bdf"; then
+			log "$bdf resize failed (kernel could not fit BAR1, see dmesg); disarmed, left at stock $((${len:-0} >> 20)) MiB"
+		else
+			log "$bdf resize failed and disarm failed (0x610=$(setpci -s "$bdf" 0x610.L 2>/dev/null), 0xbbc=$(setpci -s "$bdf" 0xbbc.L 2>/dev/null))"
+		fi
 	fi
 done
 exit 0
