@@ -1,0 +1,13 @@
+version = 1
+
+# Copyright for every file; each file carries its own SPDX-License-Identifier.
+[[annotations]]
+path = ["**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 noon-at-cgn"
+
+# Files that cannot carry a comment.
+[[annotations]]
+path = ["LICENSE"]
+precedence = "aggregate"
+SPDX-License-Identifier = "MIT"

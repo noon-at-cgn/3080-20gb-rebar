@@ -1,0 +1,1608 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# geforce-bar1-resize: give every Turing-or-later GeForce card a BAR1 at least as large as its VRAM, at boot,
+# before the NVIDIA driver binds. Config-space writes only: nothing is flashed, and a power-off undoes it.
+#
+# Usage: geforce-bar1-resize <subcommand> [options]
+#   boot [--dry-run] [--card SEL]...   enlarge BAR1 of the configured cards (the boot unit runs this)
+#   plan [--card SEL]...                boot --dry-run: log what boot would do, write nothing
+#   check [--vram SIZE] [--layout-plan] [--report] [BDF...]
+#                                       read-only report per NVIDIA display function; exit 1 if a card has no route
+#   record [--delay] [BDF]              store the VRAM size nvidia-smi reports per card, for the next boot; with BDF,
+#                                       no nvidia-smi runs for a card already recorded with the same ids. --delay (the
+#                                       record unit): wait RECORD_DELAY seconds first; nothing if the card left nvidia
+#   repair [BDF...]                     re-arm 0x610 on bound cards whose BAR1 is enlarged but a reset cleared it
+#   driver-option [--print|--check|--write] [--adopt-driver-line]
+#                                       RMForceStaticBar1=0 (DRIVER_OPTION: auto = cards enlarged through 0x610, on =
+#                                       every card with a large BAR1), one NVreg_RegistryDwordsPerDevice line in
+#                                       /etc/modprobe.d/zz-geforce-bar1-resize.conf (--check: exit 3 if another file
+#                                       has such a line, write nothing)
+# SEL: a full PCI address (0000:01:00.0), vendor:device (10de:2206) or vendor:device/subvendor:subdevice.
+#
+# Config: /etc/geforce-bar1-resize.conf ($GBR_CONF), bash, sourced; docs/configuration.md. Without it, the old
+# /etc/rebar-arm.conf is read and its REBAR_* keys are mapped (logged as deprecated).
+# Per card (docs/how-it-works.md): a function qualifies when it is NVIDIA, class 0300/0302, has a Resizable BAR
+# capability with a BAR1 entry (found by walking the capability chain), the kernel exposes resource1_resize and no
+# driver is bound. Target: the smallest 64 MiB << n >= VRAM (n 0..13; VRAM from size= in the config or the record
+# /etc/geforce-bar1-resize/vram written by `record` once the driver has seen the card). Route:
+#   none    BAR1 already >= target (never shrunk)
+#   resize  resource1_resize already lists a size >= target: resize to the smallest; 0x610 is never written
+#   0x610   the NVIDIA VSEC passes the structural checks S1-S6: arm the frame-buffer size override at 0x610 (bits
+#           11:7 only), check that it latched and that the capability widened to a superset with the target, resize
+#   best effort  neither reaches the target, but resource1_resize lists a size above the current BAR1: resize-only
+#           to the largest listed size, logged as below VRAM (decided when planning; a 0x610 that fails at boot
+#           still backs off to stock)
+#   skip    anything else, with the reason
+# Every write is verified; a card that cannot be resized is disarmed to the 0x610 value it had before the run
+# (back_off), a card whose BARs disagree with the kernel after a failed resize gets driver_override
+# geforce-bar1-hold (reboot required). Behind a PCIe switch the plain resize fails (ENOSPC, or ENOENT on 6.14-era
+# kernels); with LAYOUT=auto those cards go to the gbr_layout kernel module, in batches of one size index and at
+# most 4 root ports, while every unbound function below those root ports is held (driver_override
+# geforce-bar1-hold), and every card is resolved before the hold is released.
+# Log: stdout (the journal under systemd) first, then LOG best-effort (the root file system can be read-only at
+# early boot). `journalctl -u geforce-bar1-resize` is the authoritative log.
+set -u
+
+GBR_VERSION=0.2
+R=${GBR_ROOT:-} # install.sh --root: config and option files below this root; devices are always the live ones
+CONF=${GBR_CONF:-$R/etc/geforce-bar1-resize.conf}
+LEGACY_CONF=$R/etc/rebar-arm.conf
+STATE_DIR=${GBR_STATE_DIR:-$R/etc/geforce-bar1-resize}
+VRAM_FILE=$STATE_DIR/vram
+RUN_DIR=${GBR_RUN_DIR:-/run/geforce-bar1-resize}
+MODPROBE_DIR=${GBR_MODPROBE_DIR:-$R/etc/modprobe.d}
+OPT_FILE=$MODPROBE_DIR/zz-geforce-bar1-resize.conf
+OLD_OPT_FILE=$MODPROBE_DIR/zz-nvidia-static-bar1.conf
+# install.sh migration: the old option file's groups, read from its copy after the file was moved away
+OLD_OPT_READ=${GBR_OLD_OPT_FILE:-$OLD_OPT_FILE}
+BACKUP_DIR=$R/var/backups/geforce-bar1-resize
+NVSMI=${GBR_NVIDIA_SMI:-nvidia-smi}
+NVPROC=${GBR_NV_PROC:-/proc/driver/nvidia}
+SYSPCI=/sys/bus/pci/devices
+MODULE=gbr_layout
+HOLD_VALUE=geforce-bar1-hold
+VERIFIED_DRIVER=615.71.09
+# Labels for the log and `check` only (docs/hardware.md); they never decide whether a card is touched.
+# ids route n driver status
+LABELS=(
+	"10de:2206/10de:146d 0x610 9 615.71.09 verified"
+)
+
+usage() { sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "$0" | sed 1d; exit "${1:-0}"; }
+# without root only the first 64 bytes of config space can be read: every card would look like one without a
+# Resizable BAR capability
+need_root() { [ "$(id -u)" = 0 ] || { echo "$1: run as root (setpci cannot read extended config space otherwise)" >&2; exit 2; }; }
+SUB=${1:-boot}
+[ $# = 0 ] || shift
+case $SUB in
+	boot | plan | check | record | repair | driver-option) ;;
+	-h | --help | help) usage 0 ;;
+	*) echo "geforce-bar1-resize: unknown subcommand $SUB" >&2; usage 2 ;;
+esac
+
+# --- config ------------------------------------------------------------------------------------------------------
+unset CARDS EXCLUDE SIZE ROUTE LAYOUT DRIVER_OPTION CONSOLE LOG RECORD_DELAY REBAR_BDFS REBAR_N REBAR_IDS REBAR_ARM REBAR_LAYOUT REBAR_LOG
+declare -A CARD=()
+CONF_USED=""
+if [ -r "$CONF" ]; then CONF_USED=$CONF
+elif [ -z "${GBR_CONF:-}" ] && [ -r "$LEGACY_CONF" ]; then CONF_USED=$LEGACY_CONF; fi
+# shellcheck source=/dev/null
+[ -z "$CONF_USED" ] || . "$CONF_USED"
+
+NOTES=() # config notes, logged once the log file is known
+deprecated() { NOTES+=("deprecated key $1; use $2"); }
+IDS_FILTER=""
+if [ -n "${REBAR_BDFS+x}" ] && [ -z "${CARDS+x}" ]; then
+	CARDS=$REBAR_BDFS
+	deprecated "REBAR_BDFS=\"$REBAR_BDFS\"" "CARDS=\"$REBAR_BDFS\""
+	# the old script's default: a config that relied on it keeps its size
+	[ -n "${REBAR_N+x}" ] || [ -n "${SIZE+x}" ] || REBAR_N=9
+fi
+if [ -n "${REBAR_N+x}" ] && [ -z "${SIZE+x}" ]; then SIZE=$REBAR_N; deprecated "REBAR_N=$REBAR_N" "SIZE=$REBAR_N"; fi
+if [ -n "${REBAR_ARM+x}" ] && [ -z "${ROUTE+x}" ]; then
+	case $REBAR_ARM in
+		0x610) ROUTE=auto ;;
+		none) ROUTE=resize ;;
+		*) ROUTE=skip ;;
+	esac
+	deprecated "REBAR_ARM=$REBAR_ARM" "ROUTE=$ROUTE"
+fi
+if [ -n "${REBAR_LAYOUT+x}" ] && [ -z "${LAYOUT+x}" ]; then LAYOUT=$REBAR_LAYOUT; deprecated "REBAR_LAYOUT=$REBAR_LAYOUT" "LAYOUT=$LAYOUT"; fi
+if [ -n "${REBAR_LOG+x}" ] && [ -z "${LOG+x}" ]; then LOG=$REBAR_LOG; deprecated "REBAR_LOG=$REBAR_LOG" "LOG=$LOG"; fi
+if [ -n "${REBAR_IDS+x}" ]; then
+	IDS_FILTER=$REBAR_IDS
+	NOTES+=("deprecated key REBAR_IDS=\"$REBAR_IDS\"; kept as an extra filter (only these ids are touched)")
+	NOTES+=("remove REBAR_IDS to let the structural checks decide")
+fi
+[ -n "${CARDS+x}" ] || CARDS=auto
+[ -n "${EXCLUDE+x}" ] || EXCLUDE=""
+[ -n "${SIZE+x}" ] || SIZE=auto
+[ -n "${ROUTE+x}" ] || ROUTE=auto
+[ -n "${LAYOUT+x}" ] || LAYOUT=off
+[ -n "${DRIVER_OPTION+x}" ] || DRIVER_OPTION=auto
+[ -n "${CONSOLE+x}" ] || CONSOLE=include
+[ -n "${LOG+x}" ] || LOG=/var/log/geforce-bar1-resize.log
+[ -n "${RECORD_DELAY+x}" ] || RECORD_DELAY=60
+
+LOG_FILE=1
+log() {
+	local line
+	line="$(date -Is) $*"
+	printf '%s\n' "$line"
+	[ "$LOG_FILE" = 0 ] || { printf '%s\n' "$line" >>"$LOG"; } 2>/dev/null || true
+}
+
+# size value -> n (0..13), or "auto"; fails on anything else. 64M..512G, rounded up to a power of two.
+size_n() {
+	local v=${1^^} num mib n=0
+	case $v in
+		AUTO) echo auto; return 0 ;;
+		[0-9] | 1[0-3]) echo "$v"; return 0 ;;
+		*GIB | *GB | *G) num=${v%%G*}; [[ $num =~ ^[0-9]{1,7}$ ]] || return 1; mib=$((10#$num * 1024)) ;;
+		*MIB | *MB | *M) num=${v%%M*}; [[ $num =~ ^[0-9]{1,10}$ ]] || return 1; mib=$((10#$num)) ;;
+		*) return 1 ;;
+	esac
+	[ "$mib" -ge 64 ] && [ "$mib" -le $((512 << 10)) ] || return 1
+	while [ $((64 << n)) -lt "$mib" ]; do n=$((n + 1)); done
+	echo "$n"
+}
+# VRAM value -> MiB (plain number = GiB)
+vram_mib() {
+	local v=${1^^}
+	case $v in
+		*G | *GB | *GIB) v=${v%%G*}; [[ $v =~ ^[0-9]+$ ]] && echo $((10#$v * 1024)) ;;
+		*M | *MB | *MIB) v=${v%%M*}; [[ $v =~ ^[0-9]+$ ]] && echo $((10#$v)) ;;
+		*) [[ $v =~ ^[0-9]+$ ]] && echo $((10#$v * 1024)) ;;
+	esac
+}
+# smallest n with 64 MiB << n >= VRAM (may exceed 13; the caller checks)
+n_for_mib() { local n=0; while [ $((64 << n)) -lt "$1" ]; do n=$((n + 1)); done; echo "$n"; }
+norm_bdf() { local b=${1,,}; case $b in ????:*) ;; *) b=0000:$b ;; esac; echo "$b"; }
+valid_route() { case $1 in auto | resize | 0x610 | 0x610! | skip) ;; *) return 1 ;; esac; }
+valid_layout() { case $1 in off | auto | dryrun | force) ;; *) return 1 ;; esac; }
+valid_keys() { [[ $1 =~ ^([A-Za-z][A-Za-z0-9_]*=(0[xX][0-9a-fA-F]+|[0-9]+)\;)+$ ]]; }
+
+v=$(size_n "$SIZE") || { NOTES+=("SIZE=$SIZE invalid (auto, 0..13 or 64M..512G); using auto"); v=auto; }
+SIZE=$v
+valid_route "$ROUTE" || { NOTES+=("ROUTE=$ROUTE invalid (auto, resize, 0x610, 0x610!, skip); using auto"); ROUTE=auto; }
+valid_layout "$LAYOUT" || { NOTES+=("LAYOUT=$LAYOUT invalid (off, auto, dryrun, force); using off"); LAYOUT=off; }
+case $DRIVER_OPTION in auto | on | off) ;; *) NOTES+=("DRIVER_OPTION=$DRIVER_OPTION invalid (auto, on, off); using auto"); DRIVER_OPTION=auto ;; esac
+case $CONSOLE in include | skip) ;; *) NOTES+=("CONSOLE=$CONSOLE invalid (include, skip); using include"); CONSOLE=include ;; esac
+if [[ $RECORD_DELAY =~ ^[0-9]{1,4}$ ]] && [ $((10#$RECORD_DELAY)) -le 3600 ]; then RECORD_DELAY=$((10#$RECORD_DELAY))
+else NOTES+=("RECORD_DELAY=$RECORD_DELAY invalid (0..3600 seconds); using 60"); RECORD_DELAY=60; fi
+
+# --- device access (read-only unless stated) ---------------------------------------------------------------------
+rd() { cat "$1" 2>/dev/null; }
+ids_of() { # BDF -> vvvv:dddd/ssss:ssss
+	local d=$SYSPCI/$1 v
+	v="$(rd "$d/vendor"):$(rd "$d/device")/$(rd "$d/subsystem_vendor"):$(rd "$d/subsystem_device")"
+	echo "${v//0x/}"
+}
+bar1_len() { local start end; read -r start end _ < <(sed -n 2p "$1/resource" 2>/dev/null) && echo $((end - start + 1)); }
+mib() { echo $((${1:-0} >> 20)); }
+# Extended capability chain from 0x100, cached per function as "offset:header ..." (call it in the main shell)
+declare -A ECAPS
+ecap_list() {
+	[ -z "${ECAPS[$1]+x}" ] || return 0
+	local off=$((0x100)) hdr i list=""
+	for ((i = 0; i < 128; i++)); do
+		hdr=$(setpci -s "$1" "$(printf 0x%x "$off").L" 2>/dev/null) || break
+		[ $((0x$hdr)) != 0 ] && [ $((0x$hdr)) != $((0xffffffff)) ] || break
+		list+="$(printf 0x%x "$off"):$hdr "
+		off=$((0x$hdr >> 20))
+		[ "$off" -ge $((0x100)) ] || break
+	done
+	ECAPS[$1]=$list
+}
+ecap() { # BDF id -> offset of the first capability with that ID
+	local e
+	for e in ${ECAPS[$1]:-}; do
+		[ $((0x${e#*:} & 0xffff)) = $(($2)) ] || continue
+		echo "${e%%:*}"
+		return 0
+	done
+	return 1
+}
+ecap_at() { # BDF offset -> header of the capability the chain walk reaches at that offset
+	local e
+	for e in ${ECAPS[$1]:-}; do [ "${e%%:*}" != "$2" ] || { echo "${e#*:}"; return 0; }; done
+	return 1
+}
+# Resizable BAR (ID 0x15) entry of BAR $2: prints "<capability register> <control register>" offsets.
+rebar_entry() {
+	local base ctrl n i
+	base=$(ecap "$1" 0x15) || return 1
+	ctrl=$(setpci -s "$1" "$(printf 0x%x $((base + 8))).L" 2>/dev/null) || return 1
+	n=$(((0x$ctrl >> 5) & 7))
+	for ((i = 0; i < n; i++)); do
+		ctrl=$(setpci -s "$1" "$(printf 0x%x $((base + 8 + 8 * i))).L" 2>/dev/null) || return 1
+		if [ $((0x$ctrl & 7)) = "$2" ]; then
+			printf '0x%x 0x%x\n' $((base + 4 + 8 * i)) $((base + 8 + 8 * i))
+			return 0
+		fi
+	done
+	return 1
+}
+# largest size listed in a ReBAR capability register value (bit k = 1 MiB << (k - 4)), in MiB
+cap_max_mib() { local k m=0; for ((k = 4; k < 32; k++)); do (((0x$1 >> k) & 1)) && m=$((1 << (k - 4))); done; echo "$m"; }
+# smallest size index >= $2 listed in a resource1_resize mask (bit k = 1 MiB << k), or failure
+mask_min_from() { local k; [[ $1 =~ ^[0-9a-fA-F]+$ ]] || return 1; for ((k = $2; k < 48; k++)); do (((0x$1 >> k) & 1)) && { echo "$k"; return 0; }; done; return 1; }
+mask_max_mib() { local k m=0; [[ $1 =~ ^[0-9a-fA-F]+$ ]] || { echo 0; return; }; for ((k = 0; k < 48; k++)); do (((0x$1 >> k) & 1)) && m=$((1 << k)); done; echo "$m"; }
+# largest size index listed in a resource1_resize mask, or failure when it lists none
+mask_max_idx() { local k m=""; [[ $1 =~ ^[0-9a-fA-F]+$ ]] || return 1; for ((k = 0; k < 48; k++)); do (((0x$1 >> k) & 1)) && m=$k; done; [ -n "$m" ] && echo "$m"; }
+
+# probe BDF: read-only facts; P_REASON empty = a candidate (driver binding aside)
+declare -A P_IDS P_CLASS P_DRV P_CAP P_CTL P_REASON P_LEN P_MASK P_CAPV
+probe() {
+	local bdf=$1 dev=$SYSPCI/$1 cls ent
+	P_IDS[$bdf]=$(ids_of "$bdf") P_REASON[$bdf]="" P_DRV[$bdf]="" P_CAP[$bdf]="" P_CTL[$bdf]=""
+	cls=$(rd "$dev/class")
+	P_CLASS[$bdf]=$cls
+	[ ! -e "$dev/driver" ] || P_DRV[$bdf]=$(basename "$(readlink -f "$dev/driver")")
+	if [ "$(rd "$dev/vendor")" != 0x10de ]; then P_REASON[$bdf]="not an NVIDIA function"; return; fi
+	case $cls in 0x0300* | 0x0302*) ;; *) P_REASON[$bdf]="class $cls is not a display controller (0300 or 0302)"; return ;; esac
+	if [ -e "$dev/physfn" ]; then P_REASON[$bdf]="SR-IOV virtual function of $(basename "$(readlink -f "$dev/physfn")"), never resized"; return; fi
+	ecap_list "$bdf"
+	if ! ent=$(rebar_entry "$bdf" 1); then P_REASON[$bdf]="no ReBAR capability with a BAR1 entry (pre-Turing?)"; return; fi
+	P_CAP[$bdf]=${ent% *} P_CTL[$bdf]=${ent#* }
+	if [ ! -e "$dev/resource1_resize" ]; then P_REASON[$bdf]="no resource1_resize (the kernel cannot resize BAR1)"; return; fi
+	P_LEN[$bdf]=$(bar1_len "$dev")
+	P_MASK[$bdf]=$(rd "$dev/resource1_resize")
+	P_CAPV[$bdf]=$(setpci -s "$bdf" "${P_CAP[$bdf]}.L" 2>/dev/null)
+}
+
+# Structural checks S1-S6 for the 0x610 route (reads only; 0x610 is read only when S1-S3 pass). Sets S_FAIL (first
+# failed check), S_FAIL_NO5 (first failed check other than S5), S_610 (0x610 value or empty), S_TXT (one line each).
+xve_check() {
+	local bdf=$1 hdr v k
+	local -A res=()
+	S_610="" S_TXT=()
+	hdr=$(setpci -s "$bdf" 0x0e.B 2>/dev/null) || hdr=ff
+	[[ ${P_CLASS[$bdf]} != 0x0604* ]] && [ $((0x$hdr & 0x7f)) = 0 ] || res[6]="S6 not a type 0 endpoint (header type $hdr)"
+	if v=$(ecap_at "$bdf" 0x600) && [ $((0x$v & 0xffff)) = $((0x000b)) ] && [ $(((0x$v >> 16) & 0xf)) = 1 ]; then
+		v=$(setpci -s "$bdf" 0x604.L 2>/dev/null) || v=""
+		if [ -z "$v" ] || [ $((0x$v & 0xffff)) != 1 ] || [ $(((0x$v >> 16) & 0xf)) != 1 ] || [ $(((0x$v >> 20) & 0xfff)) != $((0x024)) ]; then
+			res[2]="S2 VSEC header at 0x604 reads ${v:-?}, not ID 0001 rev 1 len 024"
+		else
+			v=$(setpci -s "$bdf" 0x60c.L 2>/dev/null) || v=""
+			if [ -z "$v" ] || [ $(((0x$v >> 11) & 1)) != 1 ] || [ $((0x$v & 0xffffe7f8)) != 0 ]; then
+				res[3]="S3 0x60c reads ${v:-?}: FB_SIZE_OVERRIDE not supported or reserved bits set"
+			else
+				v=$(setpci -s "$bdf" 0x610.L 2>/dev/null) || v=""
+				S_610=$v
+				if [ -z "$v" ] || [ $((0x$v & 0xffffe07c)) != 0 ] || { [ $(((0x$v >> 7) & 0x1f)) != 0 ] && [ $(((0x$v >> 11) & 1)) != 1 ]; }; then
+					res[4]="S4 0x610 reads ${v:-?}: reserved bits set or an unknown stock value"
+				fi
+			fi
+		fi
+	else
+		res[1]="S1 no VSEC (ID 000b v1) at 0x600 in the capability chain"
+	fi
+	if [ "$(ecap "$bdf" 0x15)" != 0xbb0 ] || [ "${P_CAP[$bdf]}" != 0xbbc ]; then
+		res[5]="S5 ReBAR capability at $(ecap "$bdf" 0x15 || echo none), BAR1 entry at ${P_CAP[$bdf]:-none}: not the XVE layout (0xbb0, 0xbbc)"
+	fi
+	local -a okt=("" "S1 VSEC (ID 000b v1) at 0x600 in the capability chain" "S2 VSEC header ID 0001 rev 1 len 024"
+		"S3 0x60c FB_SIZE_OVERRIDE supported, reserved bits 0" "S4 0x610 reserved bits 0, stock or armed"
+		"S5 XVE layout: ReBAR at 0xbb0, BAR1 entry at 0xbbc" "S6 type 0 endpoint")
+	local skipped=0
+	S_FAIL="" S_FAIL_NO5=""
+	for k in 1 2 3 4 5 6; do
+		if [ -n "${res[$k]:-}" ]; then
+			S_TXT+=("FAIL ${res[$k]}")
+			[ -n "$S_FAIL" ] || S_FAIL=${res[$k]}
+			[ "$k" = 5 ] || [ -n "$S_FAIL_NO5" ] || S_FAIL_NO5=${res[$k]}
+			[ "$k" -gt 3 ] || skipped=1
+		elif [ "$skipped" = 1 ] && [ "$k" -le 4 ]; then
+			S_TXT+=("--   S$k not checked (an earlier check failed)")
+		else
+			S_TXT+=("ok   ${okt[k]}")
+		fi
+	done
+}
+
+# Firmware framebuffers inside the card's BARs (/proc/iomem, root only): "name@BARi ..."
+fb_children() {
+	local dev=$SYSPCI/$1 i s e line range rs re name out=""
+	local -a bs=() be=()
+	for i in 0 1 2 3 4 5; do
+		read -r s e _ < <(sed -n "$((i + 1))p" "$dev/resource" 2>/dev/null) || continue
+		bs[i]=$((s)) be[i]=$((e))
+	done
+	while IFS= read -r line; do
+		name=${line#*: }
+		case $name in BOOTFB | efifb | simpledrm | simplefb | vesafb | *framebuffer*) ;; *) continue ;; esac
+		range=${line%% : *} range=${range// /}
+		rs=$((0x${range%-*})) re=$((0x${range#*-}))
+		[ "$rs" != 0 ] || continue
+		for i in 0 1 2 3 4 5; do
+			[ -n "${bs[i]:-}" ] && [ "${bs[i]}" != 0 ] || continue
+			if [ "$rs" -ge "${bs[i]}" ] && [ "$re" -le "${be[i]}" ]; then out+="$name@BAR$i "; fi
+		done
+	done </proc/iomem 2>/dev/null
+	echo "${out% }"
+}
+# boot VGA, a framebuffer device of it, or a firmware framebuffer inside its BARs
+is_console() {
+	local dev fb
+	[ "$(rd "$SYSPCI/$1/boot_vga")" = 1 ] && return 0
+	[ -z "$(fb_children "$1")" ] || return 0
+	dev=$(readlink -f "$SYSPCI/$1")
+	for fb in /sys/class/graphics/fb*; do
+		[ "$(readlink -f "$fb/device" 2>/dev/null)" = "$dev" ] && return 0
+	done
+	return 1
+}
+
+# --- selection and per-card config ---------------------------------------------------------------------------------
+matches() { # BDF IDS SELECTOR...
+	local bdf=$1 ids=$2 s
+	shift 2
+	for s; do
+		case ${s,,} in "$bdf" | "$ids" | "${ids%%/*}") return 0 ;; esac
+		[ "$(norm_bdf "$s")" != "$bdf" ] || return 0
+	done
+	return 1
+}
+# card_cfg BDF IDS: settings for one card. First match wins: CARD[BDF] (its ids= must match the card), then
+# CARD[vvvv:dddd/ssss:ssss], then CARD[vvvv:dddd]; unset keys come from the global settings. Problems go to C_NOTES.
+card_cfg() {
+	local bdf=$1 ids=$2 key="" want="" w k v n
+	local -a words
+	C_ENABLE=yes C_SIZE=$SIZE C_ROUTE=$ROUTE C_LAYOUT=$LAYOUT C_DOPT=$DRIVER_OPTION C_CONSOLE=$CONSOLE C_KEYS="" C_FROM=""
+	C_NOTES=()
+	if [ -n "${CARD[$bdf]+x}" ]; then
+		read -r -a words <<<"${CARD[$bdf]}"
+		for w in "${words[@]}"; do [[ $w != ids=* ]] || want=${w#ids=}; done
+		want=${want,,}
+		if [ -z "$want" ] || [ "$want" = "$ids" ] || [ "$want" = "${ids%%/*}" ]; then
+			key=$bdf
+		else
+			C_NOTES+=("CARD[$bdf] ids=$want differ from the card at $bdf ($ids); entry ignored")
+		fi
+	fi
+	if [ -z "$key" ] && [ -n "${CARD[$ids]+x}" ]; then key=$ids
+	elif [ -z "$key" ] && [ -n "${CARD[${ids%%/*}]+x}" ]; then key=${ids%%/*}; fi
+	[ -n "$key" ] || return 0
+	C_FROM=$key
+	read -r -a words <<<"${CARD[$key]}"
+	for w in "${words[@]}"; do
+		k=${w%%=*} v=${w#*=}
+		[[ $w == *=* ]] || { C_NOTES+=("CARD[$key]: '$w' is not key=value; ignored"); continue; }
+		case $k in
+			enable) case $v in yes | no) C_ENABLE=$v ;; *) C_NOTES+=("CARD[$key]: enable=$v invalid (yes, no); ignored") ;; esac ;;
+			size) if n=$(size_n "$v"); then C_SIZE=$n; else C_NOTES+=("CARD[$key]: size=$v invalid (auto, 0..13, 64M..512G); ignored"); fi ;;
+			route) if valid_route "$v"; then C_ROUTE=$v; else C_NOTES+=("CARD[$key]: route=$v invalid (auto, resize, 0x610, 0x610!, skip); ignored"); fi ;;
+			layout) if valid_layout "$v"; then C_LAYOUT=$v; else C_NOTES+=("CARD[$key]: layout=$v invalid (off, auto, dryrun, force); ignored"); fi ;;
+			driver_option) case $v in auto | on | off) C_DOPT=$v ;; *) C_NOTES+=("CARD[$key]: driver_option=$v invalid (auto, on, off); ignored") ;; esac ;;
+			console) case $v in include | skip) C_CONSOLE=$v ;; *) C_NOTES+=("CARD[$key]: console=$v invalid (include, skip); ignored") ;; esac ;;
+			keys) if valid_keys "$v"; then C_KEYS=$v; else C_NOTES+=("CARD[$key]: keys=$v invalid (K=V; list, each ending in ;); ignored"); fi ;;
+			ids) [ "$key" = "$bdf" ] || C_NOTES+=("CARD[$key]: ids= only applies to BDF entries; ignored") ;;
+			*) C_NOTES+=("CARD[$key]: unknown key $k; ignored") ;;
+		esac
+	done
+}
+
+# VRAM record: <bdf> <ids> <vram_mib> <driver_version> <date>
+declare -A REC_IDS REC_MIB REC_DRV REC_DATE
+# card swaps not yet applied to the option file, <bdf> <old ids>: record writes them when it replaces the record of a
+# card with other ids, and the next driver-option --write that completes removes the file. While the card at such an
+# address is not the old one, driver-option does not keep the listing the old card had there, also when that first
+# rewrite fails or runs in another process (install.sh, a later driver-option --write)
+SWAP_FILE=$STATE_DIR/replaced
+declare -A SWAP_OLD
+load_record() {
+	local b ids m d t
+	if [ -r "$SWAP_FILE" ]; then
+		while read -r b ids _; do [[ $b =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] && SWAP_OLD[$b]=$ids; done <"$SWAP_FILE"
+	fi
+	[ -r "$VRAM_FILE" ] || return 0
+	while read -r b ids m d t _; do
+		[[ $b =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] && [[ $m =~ ^[0-9]+$ ]] || continue
+		REC_IDS[$b]=$ids REC_MIB[$b]=$m REC_DRV[$b]=$d REC_DATE[$b]=$t
+	done <"$VRAM_FILE"
+}
+
+# card_size BDF: Z_N (n) and Z_SRC, or Z_SKIP (reason) and Z_NOTE (stale record)
+VRAM_ARG=""
+card_size() {
+	local bdf=$1 m
+	Z_N="" Z_SRC="" Z_SKIP="" Z_NOTE="" Z_MIB=""
+	if [ "$C_SIZE" != auto ]; then
+		Z_N=$C_SIZE Z_SRC="size from config"
+	elif [ -n "$VRAM_ARG" ]; then
+		Z_MIB=$VRAM_ARG Z_SRC="VRAM $VRAM_ARG MiB (--vram)"
+	elif [ -n "${REC_MIB[$bdf]+x}" ] && [ "${REC_IDS[$bdf]}" = "${P_IDS[$bdf]}" ]; then
+		Z_MIB=${REC_MIB[$bdf]} Z_SRC="VRAM ${REC_MIB[$bdf]} MiB (record)"
+	else
+		[ -z "${REC_MIB[$bdf]+x}" ] || Z_NOTE="VRAM record is for ${REC_IDS[$bdf]}, the card is ${P_IDS[$bdf]}; record ignored"
+		Z_SKIP="VRAM unknown (driver never seen this card); recorded when the driver loads, enlarged next boot"
+		return
+	fi
+	if [ -n "$Z_MIB" ]; then
+		m=$(n_for_mib "$Z_MIB")
+		if [ "$m" -gt 13 ]; then
+			Z_SKIP="VRAM $Z_MIB MiB needs n = $m, above the ReBAR maximum 512 GiB (n = 13)"
+			return
+		fi
+		Z_N=$m
+	fi
+}
+
+# plan BDF: route for a candidate (card_cfg first). Sets R_* for it; reads only. R_BELOW, R_BELOW2: what the
+# best-effort resize to the largest listed size below the target does, and why (empty when the target is reachable).
+# R_WHY2, R_SNOTE2: a second log line for R_WHY (route skip) and R_SNOTE, or empty.
+declare -A R_ROUTE R_WHY R_WHY2 R_N R_IDX R_VAL R_LAYOUT R_DOPT R_HEAD R_SNOTE R_SNOTE2 R_FB R_BELOW R_BELOW2
+plan() {
+	local bdf=$1 n t len kl kmax capmax val armed=0 fb
+	R_ROUTE[$bdf]=skip R_WHY[$bdf]="" R_WHY2[$bdf]="" R_N[$bdf]="" R_IDX[$bdf]="" R_VAL[$bdf]="" R_SNOTE[$bdf]=""
+	R_SNOTE2[$bdf]="" R_FB[$bdf]="" R_BELOW[$bdf]="" R_BELOW2[$bdf]=""
+	R_LAYOUT[$bdf]=$C_LAYOUT R_DOPT[$bdf]=$C_DOPT R_HEAD[$bdf]=""
+	if [ "$C_ENABLE" = no ]; then R_WHY[$bdf]="enable=no in config" R_LAYOUT[$bdf]=off Z_N="" Z_SRC="" Z_SKIP="" Z_NOTE="" Z_MIB=""; return; fi
+	len=${P_LEN[$bdf]:-0}
+	card_size "$bdf"
+	[ -z "$Z_NOTE" ] || R_SNOTE[$bdf]=$Z_NOTE
+	R_HEAD[$bdf]="${Z_SRC:-VRAM unknown}, BAR1 $(mib "$len") MiB"
+	if [ -n "$Z_SKIP" ]; then R_WHY[$bdf]=$Z_SKIP; return; fi
+	n=$Z_N
+	t=$((64 << (n + 20)))
+	R_N[$bdf]=$n
+	R_HEAD[$bdf]="$Z_SRC, target $(mib "$t") MiB, BAR1 $(mib "$len") MiB"
+	if [ "$C_ROUTE" = skip ]; then R_WHY[$bdf]="route=skip in config"; return; fi
+	if [ "$len" -ge "$t" ]; then
+		R_ROUTE[$bdf]=none R_IDX[$bdf]=$((n + 6))
+		R_WHY[$bdf]="BAR1 already $(mib "$len") MiB, skip"
+		return
+	fi
+	kl=$(mask_min_from "${P_MASK[$bdf]}" $((n + 6))) || kl=""
+	if [ "$C_ROUTE" = resize ]; then
+		if [ -n "$kl" ]; then R_ROUTE[$bdf]=resize R_IDX[$bdf]=$kl
+		else
+			R_WHY[$bdf]="ReBAR capability does not advertise $(mib "$t") MiB (resource1_resize mask ${P_MASK[$bdf]:-absent})"
+			R_WHY2[$bdf]="route resize never writes 0x610, skip"
+		fi
+	else
+		xve_check "$bdf"
+		[ -n "$S_610" ] && [ $(((0x$S_610 >> 11) & 1)) = 1 ] && armed=1
+		if [ "$C_ROUTE" = auto ] && [ -z "$S_FAIL" ] && [ "$armed" = 1 ]; then R_ROUTE[$bdf]=0x610
+		elif [ "$C_ROUTE" = auto ] && [ -n "$kl" ]; then R_ROUTE[$bdf]=resize R_IDX[$bdf]=$kl
+		elif [ "$C_ROUTE" != 0x610! ] && [ -z "$S_FAIL" ]; then R_ROUTE[$bdf]=0x610
+		elif [ "$C_ROUTE" = 0x610! ] && [ -z "$S_FAIL_NO5" ]; then R_ROUTE[$bdf]=0x610 R_WHY[$bdf]=forced
+		else
+			R_SNOTE[$bdf]="${P_IDS[$bdf]}: ${S_FAIL_NO5:-$S_FAIL}"
+			[ "$C_ROUTE" = 0x610! ] || R_SNOTE[$bdf]="${P_IDS[$bdf]}: $S_FAIL"
+			R_SNOTE2[$bdf]="0x610 route not available"
+			R_WHY[$bdf]="capability lists up to $(mask_max_mib "${P_MASK[$bdf]}") MiB < target $(mib "$t") MiB, and the 0x610 route is not available"
+		fi
+		if [ "${R_ROUTE[$bdf]}" = 0x610 ]; then
+			# never arm below what the capability already lists (it could shrink the list)
+			capmax=$(cap_max_mib "${P_CAPV[$bdf]:-0}") val=$n
+			while [ $((64 << val)) -lt "$capmax" ] && [ "$val" -lt 13 ]; do val=$((val + 1)); done
+			R_VAL[$bdf]=$val R_IDX[$bdf]=$((n + 6))
+		fi
+	fi
+	# best effort: no route reaches the target, but the card lists a size above its current BAR1. Resize-only to the
+	# largest listed size (0x610 never written); never below the current BAR1. Decided here, at planning time: a 0x610
+	# route that fails at boot backs off as before.
+	if [ "${R_ROUTE[$bdf]}" = skip ] && kmax=$(mask_max_idx "${P_MASK[$bdf]}") && [ $((1 << (kmax + 20))) -gt "$len" ]; then
+		local below="below VRAM ($Z_MIB MiB)" why="the 0x610 route is not available"
+		[ -n "$Z_MIB" ] || below="below the configured $(mib "$t") MiB"
+		[ "$C_ROUTE" != resize ] || why="route=resize never writes 0x610"
+		R_BELOW[$bdf]="resize to $((1 << kmax)) MiB, the largest size the card lists; $below"
+		R_BELOW2[$bdf]="because the card does not list $(mib "$t") MiB and $why"
+		R_ROUTE[$bdf]=resize R_IDX[$bdf]=$kmax R_WHY[$bdf]=""
+	fi
+	# console card (docs/console.md): included unless console=skip; a 0302 function with a firmware framebuffer
+	# inside its BARs is always skipped, because the kernel would not remove that framebuffer before the resize
+	if [ "${R_ROUTE[$bdf]}" = resize ] || [ "${R_ROUTE[$bdf]}" = 0x610 ]; then
+		fb=$(fb_children "$bdf")
+		R_FB[$bdf]=$fb
+		if [ -n "$fb" ] && [[ ${P_CLASS[$bdf]} == 0x0302* ]]; then
+			R_ROUTE[$bdf]=skip R_WHY[$bdf]="firmware framebuffer ($fb) inside ${fb##*@} of a non-VGA function; the kernel would not remove it"
+		elif [ "$C_CONSOLE" = skip ] && is_console "$bdf"; then
+			R_ROUTE[$bdf]=skip R_WHY[$bdf]="console card (console=skip)"
+		fi
+	fi
+}
+label() { # BDF route n -> verified | reported | untested
+	local row
+	local -a cols
+	for row in "${LABELS[@]}"; do
+		read -r -a cols <<<"$row"
+		if [ "${cols[0]}" = "${P_IDS[$1]}" ] && [ "${cols[1]}" = "$2" ] && [ "${cols[2]}" = "$3" ]; then echo "${cols[4]}"; return; fi
+	done
+	echo untested
+}
+ampere_ada() { local d=$((0x$(rd "$SYSPCI/$1/device" | sed 's/^0x//'))); [ "$d" -ge $((0x2200)) ] && [ "$d" -lt $((0x2300)) ] || { [ "$d" -ge $((0x2400)) ] && [ "$d" -lt $((0x2900)) ]; }; }
+
+# Cards in scope: CARDS (auto: every NVIDIA display function) narrowed by --card, EXCLUDE and REBAR_IDS.
+# Fills SCOPE (in order) and logs each function that is left out (unless quiet).
+SELECT=()
+SCOPE=()
+scope() { # quiet(0|1) include-bound(0|1)
+	local q=$1 inc=$2 bdf dev ids list=()
+	if [ "$CARDS" = auto ]; then
+		# SR-IOV virtual functions (physfn link) are skipped without a line: they have no BAR1 of their own to resize
+		for dev in "$SYSPCI"/*; do
+			[ "$(rd "$dev/vendor")" = 0x10de ] && [[ $(rd "$dev/class") == 0x030[02]* ]] && [ ! -e "$dev/physfn" ] && list+=("${dev##*/}")
+		done
+	else
+		for bdf in $CARDS; do list+=("$(norm_bdf "$bdf")"); done
+	fi
+	for bdf in "${list[@]}"; do
+		[[ " ${SCOPE[*]} " != *" $bdf "* ]] || continue
+		dev=$SYSPCI/$bdf
+		if [ ! -e "$dev" ]; then [ "$q" = 1 ] || log "$bdf absent, skip"; continue; fi
+		ids=$(ids_of "$bdf")
+		if [ ${#SELECT[@]} -gt 0 ] && ! matches "$bdf" "$ids" "${SELECT[@]}"; then continue; fi
+		# shellcheck disable=SC2086 # EXCLUDE is a word list
+		if [ -n "$EXCLUDE" ] && matches "$bdf" "$ids" $EXCLUDE; then [ "$q" = 1 ] || log "$bdf $ids: not a candidate: excluded by config"; continue; fi
+		if [ -n "$IDS_FILTER" ] && [[ " $IDS_FILTER " != *" ${ids%%/*} "* ]]; then
+			[ "$q" = 1 ] || log "$bdf is ${ids%%/*}, not in REBAR_IDS ($IDS_FILTER), skip"
+			continue
+		fi
+		probe "$bdf"
+		if [ -n "${P_REASON[$bdf]}" ]; then [ "$q" = 1 ] || log "$bdf $ids: not a candidate: ${P_REASON[$bdf]}"; continue; fi
+		if [ "$inc" = 0 ] && [ -n "${P_DRV[$bdf]}" ]; then
+			[ "$q" = 1 ] || log "$bdf already bound to ${P_DRV[$bdf]}, skip"
+			continue
+		fi
+		SCOPE+=("$bdf")
+	done
+}
+# configure and plan every card in SCOPE; logs the config notes unless quiet
+plan_scope() { # quiet
+	local bdf note
+	for bdf in "${SCOPE[@]}"; do
+		card_cfg "$bdf" "${P_IDS[$bdf]}"
+		[ "$1" = 1 ] || for note in "${C_NOTES[@]}"; do log "$bdf $note"; done
+		plan "$bdf"
+	done
+}
+
+# --- the 0x610 route and resize (per card; globals set by set_card) --------------------------------------------------
+MASK=$((0x0f80)) # bits 11:7 only; bit 12 (GEN3) and bit 0 (GEN2) stay as shipped
+declare -A CAPBIT NATIVE CAPREG
+set_card() { # BDF: per-card globals for the helpers below
+	N=${R_N[$1]} IDX=${R_IDX[$1]}
+	BYTES=$((1 << (IDX + 20)))
+	SIZE_TXT="$((BYTES >> 20)) MiB"
+	VAL=${R_VAL[$1]:-$N}
+	FIELD=$((0x800 | VAL << 7)) # FB_SIZE_OVERRIDE_EN (bit 11) + VAL (bits 10:7)
+	SET=$(printf '%08x:%08x' "$FIELD" "$MASK")
+	CAPREG[$1]=${P_CAP[$1]}
+	CAPBIT[$1]=$((N + 10)) # capability register bit of the target (bit 10 = 64 MiB)
+}
+cap_read() { setpci -s "$1" "${CAPREG[$1]}.L"; }
+armed() { [ $((0x$(setpci -s "$1" 0x610.L) & MASK)) = "$FIELD" ]; }
+cap_wide() { [ $(((0x$(cap_read "$1") >> CAPBIT[$1]) & 1)) = 1 ]; }
+# write bits 11:7 back to $2 and check that the capability narrowed again (unless it listed the target natively)
+disarm() {
+	setpci -s "$1" "0x610.L=$(printf '%08x:%08x' "$2" "$MASK")" &&
+		[ $((0x$(setpci -s "$1" 0x610.L) & MASK)) = "$2" ] && { [ "${NATIVE[$1]:-0}" = 1 ] || ! cap_wide "$1"; }
+}
+disarm_failed() { echo "0x610=$(setpci -s "$1" 0x610.L 2>/dev/null), ${CAPREG[$1]}=$(cap_read "$1" 2>/dev/null)"; }
+# the card cannot be resized after arming: it must not stay armed at its stock BAR1
+back_off() { # BDF restore reason
+	if disarm "$1" "$2"; then
+		log "$1 $3; disarmed, skip resize"
+	else
+		log "$1 $3, and disarm failed ($(disarm_failed "$1"))"
+	fi
+}
+# Some kernels (seen on Ubuntu 6.8) do not rewrite the BARs when a resize fails: BAR1's register keeps the address
+# with the low bits that the larger ReBAR size made read-only cleared, while the kernel's resource is back at the
+# old address, so several cards can decode the same range. After a failed resize every 64-bit prefetchable BAR of
+# the card is compared with its sysfs resource (x86: bus address = CPU address). BAR1 in exactly that pattern is
+# rewritten from the resource with memory decode off; any other mismatch, or a rewrite that does not stick, makes
+# the card unsafe (returns 1).
+rewrite_bar() { # BDF reg start old-low-dword
+	local cmd lo hi
+	cmd=$(setpci -s "$1" 0x04.W 2>/dev/null) || return 1
+	setpci -s "$1" "0x04.W=$(printf %04x $((0x$cmd & ~2)))"
+	setpci -s "$1" "$(printf 0x%x "$2").L=$(printf %08x $((($3 & 0xfffffff0) | (0x$4 & 0xf))))"
+	setpci -s "$1" "$(printf 0x%x $(($2 + 4))).L=$(printf %08x $(($3 >> 32)))"
+	setpci -s "$1" "0x04.W=$cmd"
+	lo=$(setpci -s "$1" "$(printf 0x%x "$2").L") && hi=$(setpci -s "$1" "$(printf 0x%x $(($2 + 4))).L") &&
+		[ $(((0x$hi << 32) | (0x$lo & 0xfffffff0))) = $(($3)) ]
+}
+check_bars() { # BDF sysfs-dir
+	local i start flags reg lo hi got bad=0
+	for i in 0 1 2 3 4 5; do
+		read -r start _ flags < <(sed -n "$((i + 1))p" "$2/resource" 2>/dev/null) || continue
+		[ $((${flags:-0} & 0x102200)) = $((0x102200)) ] && [ $((start)) != 0 ] || continue # 64-bit prefetchable
+		reg=$((0x10 + 4 * i))
+		if ! lo=$(setpci -s "$1" "$(printf 0x%x $reg).L" 2>/dev/null) ||
+			! hi=$(setpci -s "$1" "$(printf 0x%x $((reg + 4))).L" 2>/dev/null); then
+			log "$1 BAR$i register unreadable after the failed resize"
+			bad=1
+			continue
+		fi
+		got=$(((0x$hi << 32) | (0x$lo & 0xfffffff0)))
+		[ "$got" != $((start)) ] || continue
+		if [ "$i" = 1 ] && [ "$got" = $((start & ~(BYTES - 1))) ] && rewrite_bar "$1" "$reg" "$start" "$lo"; then
+			log "$1 BAR1 register was left at $(printf 0x%x "$got") by the failed resize; rewritten to the kernel's $start"
+			continue
+		fi
+		log "$1 BAR$i register reads $(printf 0x%x "$got"), the kernel's resource starts at $start after the failed resize"
+		bad=1
+	done
+	return $bad
+}
+# A card whose BARs disagree with the kernel must not get a driver: hold it until a reboot (config space is volatile).
+hold_card() { # BDF
+	local fn=$SYSPCI/$1 ovr
+	ovr=$(rd "$fn/driver_override")
+	if [ ! -e "$fn/driver" ] && { [ -z "$ovr" ] || [ "$ovr" = "(null)" ]; } &&
+		echo "$HOLD_VALUE" 2>/dev/null >"$fn/driver_override"; then
+		log "$1 BAR registers disagree with the kernel: driver_override $HOLD_VALUE set, reboot required"
+	else
+		log "$1 BAR registers disagree with the kernel and its driver_override could not be held"
+		log "$1 do not load a driver for it, reboot"
+	fi
+}
+# strerror in English whatever the locale: it decides whether the layout module may try
+resize() { # BDF sysfs-dir
+	local rc
+	err=$(export LC_ALL=C; echo "$IDX" 2>&1 >"$2/resource1_resize")
+	rc=$?
+	e=${err##*: } e=${e:-unknown error}
+	return $rc
+}
+# ENOSPC: a window above could not grow; ENOENT (6.14): no window on the path could be released
+layout_errno() { [ "${R_LAYOUT[$1]}" != off ] && [[ $e == "No space left on device" || $e == "No such file or directory" ]]; }
+layout_note() { # BDF: the module refuses a root port with the boot VGA device or a foreign child below it
+	if [ "$(rd "$SYSPCI/$1/boot_vga")" = 1 ] || [ -n "${R_FB[$1]}" ]; then
+		log "$1 is the console card: the layout module refuses its root port"
+		log "$1 put it on a CPU root port, or set console=skip for it so the other cards on that root can go ahead"
+	fi
+}
+
+declare -A RESULT # bdf -> enlarged | stock | unknown, for $RUN_DIR/cards
+LAYOUT_BDFS=()
+declare -A LAYOUT_RESTORE
+to_layout() { # BDF restore
+	LAYOUT_BDFS+=("$1") LAYOUT_RESTORE[$1]=$2
+	layout_note "$1"
+}
+console_line() { # BDF verb
+	local fb=${R_FB[$1]}
+	if [[ ${P_CLASS[$1]} == 0x0300* ]] && is_console "$1"; then
+		log "$1 console card: the kernel $2 the firmware framebuffer (${fb:-none found in its BARs}) before the resize"
+		log "$1 the console returns when nvidia-drm (fbdev=1) or a display server takes over"
+		if ! ampere_ada "$1" && ! modprobe -c 2>/dev/null | grep -Eq '^options nvidia[-_]drm .*(modeset|fbdev)=1'; then
+			log "$1 note: on this family, with the firmware framebuffer gone and nvidia-drm modeset/fbdev not configured,"
+			log "$1 note: the driver may make VBE int10h calls on unload (a 2-4 min hang reported on Blackwell with CSM)"
+			log "$1 note: console=skip leaves this card stock"
+		fi
+	fi
+}
+
+# run_card BDF: execute the planned route for one card (boot, not dry-run)
+run_card() {
+	local bdf=$1 dev=$SYSPCI/$1 len mask prev restore cap0 cap1 rt=${R_ROUTE[$1]}
+	set_card "$bdf"
+	case $rt in
+		none)
+			if [ -n "${S_610_OF[$bdf]:-}" ] && [ $(((0x${S_610_OF[$bdf]} >> 11) & 1)) = 1 ]; then
+				log "$bdf already armed and resized ($(mib "${P_LEN[$bdf]}") MiB), skip"
+			else
+				log "$bdf ${R_WHY[$bdf]}"
+			fi
+			return
+			;;
+		skip) skip_lines "$bdf"; return ;;
+	esac
+	console_line "$bdf" removes
+	if [ "$rt" = resize ]; then
+		[ -z "${R_BELOW[$bdf]}" ] || { log "$bdf ${R_BELOW[$bdf]}"; log "$bdf ${R_BELOW2[$bdf]}"; }
+		log "$bdf route resize-only: resource1_resize lists $SIZE_TXT; 0x610 untouched"
+		if ! mask=$(rd "$dev/resource1_resize") || [ $(((0x${mask:-0} >> IDX) & 1)) != 1 ]; then
+			log "$bdf ReBAR capability does not advertise $SIZE_TXT (resource1_resize mask ${mask:-absent})"
+			log "$bdf route resize never writes 0x610, skip"
+			return
+		fi
+		if [ "${R_LAYOUT[$bdf]}" = force ]; then
+			to_layout "$bdf" none
+			log "$bdf layout=force, the resize is left to the layout module"; return
+		fi
+		if resize "$bdf" "$dev" && [ "$(bar1_len "$dev")" = "$BYTES" ]; then
+			log "$bdf resized to $SIZE_TXT (resize only, 0x610 untouched)"
+			RESULT[$bdf]=enlarged
+			return
+		fi
+		len=$(bar1_len "$dev")
+		[ -n "$err" ] || e="resize reported success but BAR1 is $(mib "$len") MiB"
+		if ! check_bars "$bdf" "$dev"; then
+			log "$bdf resize failed ($e); left at its current $(mib "$len") MiB"
+			hold_card "$bdf"
+			RESULT[$bdf]=unknown
+		elif [ "$len" = "$BYTES" ]; then
+			log "$bdf resize write failed but BAR1 is $SIZE_TXT"
+			RESULT[$bdf]=enlarged
+		elif layout_errno "$bdf"; then
+			to_layout "$bdf" none
+			log "$bdf resize failed ($e); left to the layout module (a PCIe switch above it?)"
+		else
+			log "$bdf resize failed ($e); left at its current $(mib "$len") MiB"
+		fi
+		return
+	fi
+
+	# 0x610 route
+	log "$bdf route 0x610 VAL=$VAL: arm, then resize to $SIZE_TXT${R_WHY[$bdf]:+ (${R_WHY[$bdf]}: S5 waived)}"
+	prev=$(setpci -s "$bdf" 0x610.L 2>/dev/null) || { log "$bdf 0x610 unreadable"; return; }
+	restore=$((0x$prev & MASK))                     # bits 11:7 before this run; stock: 0 (EN=0 VAL=0)
+	[ $(((restore >> 11) & 1)) = 0 ] || restore=0 # armed by an earlier run: back off to stock
+	cap0=$(cap_read "$bdf") || { log "$bdf ReBAR capability ${CAPREG[$bdf]} unreadable"; return; }
+	NATIVE[$bdf]=0
+	[ $(((0x$prev >> 11) & 1)) = 0 ] && [ $(((0x$cap0 >> CAPBIT[$bdf]) & 1)) = 1 ] && NATIVE[$bdf]=1
+	if ! armed "$bdf"; then
+		setpci -s "$bdf" "0x610.L=$SET" || { log "$bdf 0x610 write failed"; return; }
+	fi
+	if ! armed "$bdf"; then # a read killed mid-run also lands here: restore rather than leave it maybe armed
+		back_off "$bdf" "$restore" "0x610 did not latch (reads $(setpci -s "$bdf" 0x610.L))"; return
+	fi
+	cap1=$(cap_read "$bdf")
+	if [ $(((0x$cap0 & ~0x${cap1:-0}) & 0xfffffff0)) != 0 ]; then
+		back_off "$bdf" "$restore" "capability lost sizes it listed before arming (before $cap0, after ${cap1:-?})"; return
+	fi
+	if ! cap_wide "$bdf"; then
+		back_off "$bdf" "$restore" "capability did not widen to $SIZE_TXT (before $cap0, after $(cap_read "$bdf"))"; return
+	fi
+	if [ "$(bar1_len "$dev")" = "$BYTES" ]; then
+		log "$bdf already armed and resized ($SIZE_TXT), skip"; RESULT[$bdf]=enlarged; return
+	fi
+	if [ "${R_LAYOUT[$bdf]}" = force ]; then
+		to_layout "$bdf" "$restore"
+		log "$bdf armed; layout=force, the resize is left to the layout module"; return
+	fi
+	mask=$(rd "$dev/resource1_resize") || mask=0
+	if [ $(((0x${mask:-0} >> IDX) & 1)) != 1 ]; then
+		back_off "$bdf" "$restore" "resize mask not widened ($mask)"; return
+	fi
+	if resize "$bdf" "$dev" && [ "$(bar1_len "$dev")" = "$BYTES" ]; then
+		log "$bdf armed and resized to $SIZE_TXT"
+		RESULT[$bdf]=enlarged
+		return
+	fi
+	len=$(bar1_len "$dev")
+	[ -n "$err" ] || e="resize reported success but BAR1 is $(mib "$len") MiB"
+	if ! check_bars "$bdf" "$dev"; then
+		if disarm "$bdf" "$restore"; then
+			log "$bdf resize failed ($e, see dmesg); disarmed, left at stock $(mib "$len") MiB"
+		else
+			log "$bdf resize failed ($e) and disarm failed ($(disarm_failed "$bdf"))"
+		fi
+		hold_card "$bdf"
+		RESULT[$bdf]=unknown
+	elif [ "$len" = "$BYTES" ]; then
+		log "$bdf armed; resize write failed but BAR1 is $SIZE_TXT, left armed"
+		RESULT[$bdf]=enlarged
+	elif layout_errno "$bdf"; then
+		to_layout "$bdf" "$restore"
+		log "$bdf resize failed ($e); left armed for the layout module (a PCIe switch above it?)"
+	elif disarm "$bdf" "$restore"; then
+		log "$bdf resize failed ($e, see dmesg); disarmed, left at stock $(mib "$len") MiB"
+	else
+		log "$bdf resize failed ($e) and disarm failed ($(disarm_failed "$bdf"))"
+	fi
+}
+
+skip_lines() { # BDF: the route skip line, and its second line if any
+	log "$1 route skip: ${R_WHY[$1]}"
+	[ -z "${R_WHY2[$1]}" ] || log "$1 ${R_WHY2[$1]}"
+}
+# dry_card BDF: what run_card would do; writes nothing
+dry_card() {
+	local bdf=$1 via=""
+	set_card "$bdf"
+	[ "${R_LAYOUT[$bdf]}" != force ] || via="; layout=force: via the layout module"
+	case ${R_ROUTE[$bdf]} in
+		none) log "$bdf ${R_WHY[$bdf]}" ;;
+		skip) skip_lines "$bdf" ;;
+		resize)
+			console_line "$bdf" "would remove"
+			[ -z "${R_BELOW[$bdf]}" ] || { log "$bdf ${R_BELOW[$bdf]}"; log "$bdf ${R_BELOW2[$bdf]}"; }
+			log "$bdf would resize BAR1 to $SIZE_TXT (resize only)$via"
+			;;
+		0x610)
+			console_line "$bdf" "would remove"
+			log "$bdf would arm 0x610 VAL=$VAL and resize BAR1 to $SIZE_TXT${R_WHY[$bdf]:+ (${R_WHY[$bdf]}: S5 waived)}$via"
+			;;
+	esac
+}
+
+# --- layout module (LAYOUT auto, dryrun or force), in batches ----------------------------------------------------------
+HELD=()
+root_of() { # BDF -> root port sysfs dir, or empty on a root bus
+	local path rel rest
+	path=$(readlink -f "$SYSPCI/$1") || return 0
+	rel=${path#/sys/devices/} rest=${path#/sys/devices/*/}
+	[[ $rest == */* ]] || return 0
+	echo "/sys/devices/${rel%%/*}/${rest%%/*}"
+}
+# Driver hold: every unbound non-bridge function below the root ports of the given cards whose driver_override
+# is empty gets one no driver has. An existing override (e.g. vfio-pci) is never touched.
+hold() {
+	local bdf root f ovr seen=" "
+	for bdf; do
+		root=$(root_of "$bdf")
+		[ -n "$root" ] || continue # on a root bus: the module refuses it
+		[[ $seen == *" $root "* ]] && continue
+		seen+="$root "
+		while IFS= read -r f; do
+			[[ $(rd "$f/class") == 0x0604* ]] && continue
+			if [ -e "$f/driver" ]; then
+				log "${f##*/} is bound to $(basename "$(readlink -f "$f/driver")"); the layout refuses its root port"
+				continue
+			fi
+			ovr=$(cat "$f/driver_override" 2>/dev/null) || continue
+			if [ -n "$ovr" ] && [ "$ovr" != "(null)" ]; then
+				log "${f##*/} keeps its driver_override $ovr"
+				continue
+			fi
+			echo "$HOLD_VALUE" 2>/dev/null >"$f/driver_override" && HELD+=("$f")
+		done < <(find "$root" -type d -name '[0-9a-f][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f].[0-7]' | sort)
+	done
+	[ ${#HELD[@]} = 0 ] || log "driver hold (driver_override $HOLD_VALUE) on ${HELD[*]##*/}"
+}
+release() { # [root port dirs]: functions below those keep the hold (their state is unknown)
+	local f r keep held_on=() released=()
+	[ ${#HELD[@]} -gt 0 ] || return 0
+	for f in "${HELD[@]}"; do
+		keep=0
+		for r; do [[ $f != "$r"/* ]] || keep=1; done
+		if [ "$keep" = 1 ]; then held_on+=("$f"); continue; fi
+		printf '\n' 2>/dev/null >"$f/driver_override"
+		echo "${f##*/}" 2>/dev/null >/sys/bus/pci/drivers_probe
+		released+=("$f")
+	done
+	[ ${#released[@]} = 0 ] || log "driver hold released on ${released[*]##*/}"
+	HELD=("${held_on[@]}")
+}
+klog_last_start() { dmesg 2>/dev/null | grep "$MODULE: start " | tail -n 1; }
+# Batches: one size index and dry_run value each, at most 4 root ports (the module refuses more). Sets B_N,
+# B_TGT[i] (comma list), B_IDX[i], B_DRY[i], B_ROOTS[i].
+make_batches() { # BDF...
+	local bdf idx dry root key i nr
+	B_N=0 B_TGT=() B_IDX=() B_DRY=() B_ROOTS=()
+	for bdf; do
+		idx=${R_IDX[$bdf]} dry=0 root=$(root_of "$bdf")
+		[ "${R_LAYOUT[$bdf]}" = dryrun ] && dry=1
+		root=${root:-bus:$bdf}
+		key=""
+		for ((i = 0; i < B_N; i++)); do
+			[ "${B_IDX[i]}" = "$idx" ] && [ "${B_DRY[i]}" = "$dry" ] || continue
+			nr=$(wc -w <<<"${B_ROOTS[i]}")
+			if [[ " ${B_ROOTS[i]} " == *" $root "* ]] || [ "$nr" -lt 4 ]; then key=$i; break; fi
+		done
+		if [ -z "$key" ]; then
+			key=$B_N B_N=$((B_N + 1))
+			B_TGT[key]="" B_IDX[key]=$idx B_DRY[key]=$dry B_ROOTS[key]=""
+		fi
+		B_TGT[key]+="${B_TGT[key]:+,}$bdf"
+		[[ " ${B_ROOTS[key]} " == *" $root "* ]] || B_ROOTS[key]+="${B_ROOTS[key]:+ }$root"
+	done
+}
+# run_module targets idx dry -> MOD_RC MOD_OUT MOD_KLOG; logs the call and the module's lines
+run_module() {
+	local before
+	before=$(klog_last_start)
+	MOD_OUT=$(modprobe "$MODULE" "targets=$1" bar=1 "size=$2" "dry_run=$3" 2>&1)
+	MOD_RC=$?
+	MOD_KLOG=""
+	# the module's lines from its last "start" line on, if that line is new (a full ring buffer drops old lines)
+	if [ "$(klog_last_start)" != "$before" ]; then
+		MOD_KLOG=$(dmesg 2>/dev/null | awk -v m="$MODULE:" '$0 ~ m" start "{b=""} index($0, m){b=b $0 "\n"} END{printf "%s", b}' |
+			sed 's/^\[[^]]*\] *//')
+	fi
+	[ -d "/sys/module/$MODULE" ] && rmmod "$MODULE"
+	local line
+	log "modprobe $MODULE targets=$1 size=$2 dry_run=$3: exit $MOD_RC"
+	while IFS= read -r line; do [ -z "$line" ] || log "  $line"; done <<<"$MOD_OUT"
+	while IFS= read -r line; do [ -z "$line" ] || log "$line"; done <<<"$MOD_KLOG"
+}
+declare -A CARD_KH
+layout_phase() {
+	local i bdf root keep_hold="" kh dev len bad_roots=" "
+	make_batches "${LAYOUT_BDFS[@]}"
+	# keep_hold: "rollback-failed" (decode left off below a root port) or "unknown" (modprobe failed without saying
+	# why and the module's result is not in the kernel log, e.g. modprobe was killed): no 0x610 write and no driver
+	# release for the cards below the roots of that batch; a reboot restores stock. -ENOTRECOVERABLE is the only
+	# unsafe module result; any other "could not insert" means init never ran (Secure Boot, wrong kernel, unknown
+	# symbol), refused, or rolled back: the cards are stock.
+	if [ "$SIGNALLED" = 1 ]; then
+		log "signal received; the layout module is not run"
+	elif ! modinfo "$MODULE" >/dev/null 2>&1; then
+		log "$MODULE module not found for kernel $(uname -r) (install.sh --layout-module builds it)"
+	else
+		hold "${LAYOUT_BDFS[@]}"
+		for ((i = 0; i < B_N; i++)); do
+			if [ "$SIGNALLED" = 1 ]; then log "signal received; layout batches $((i + 1))..$B_N are not run"; break; fi
+			if [ -n "$keep_hold" ]; then log "layout batches $((i + 1))..$B_N are not run after the failed batch"; break; fi
+			[ "$B_N" = 1 ] || log "layout batch $((i + 1))/$B_N: root ports ${B_ROOTS[i]//\/sys\/devices\//}"
+			run_module "${B_TGT[i]}" "${B_IDX[i]}" "${B_DRY[i]}"
+			kh=""
+			# -ENOTRECOVERABLE is returned only for a failed rollback; modprobe prints its strerror
+			if [[ $MOD_KLOG == *"result rollback-failed"* || ${MOD_OUT,,} == *"not recoverable"* ]]; then
+				kh=rollback-failed
+				log "$MODULE rollback failed: driver hold kept on ${HELD[*]##*/}; reboot required"
+			elif [ "$MOD_RC" != 0 ] && [[ $MOD_KLOG != *"$MODULE: done rc="* ]]; then
+				if [[ $MOD_OUT == *"could not insert '$MODULE'"* || $MOD_OUT == *"Module $MODULE not found"* ]]; then
+					log "$MODULE did not run or changed nothing (modprobe exit $MOD_RC, see its error above)"
+					log "  the cards go back to stock and the hold is released"
+				else
+					kh=unknown
+					log "$MODULE outcome unknown (modprobe exit $MOD_RC, no result in the kernel log)"
+					log "  driver hold kept on ${HELD[*]##*/}; reboot required"
+				fi
+			fi
+			if [ -n "$kh" ]; then
+				keep_hold=$kh
+				bad_roots+="${B_ROOTS[i]} "
+				for bdf in ${B_TGT[i]//,/ }; do CARD_KH[$bdf]=$kh; done
+			fi
+		done
+		# every card below a root port of the failed batch has an unknown state: those of batches that did not run,
+		# and those an earlier batch enlarged on the same root port
+		for bdf in "${LAYOUT_BDFS[@]}"; do
+			[ -z "${CARD_KH[$bdf]:-}" ] || continue
+			root=$(root_of "$bdf")
+			[ -n "$root" ] && [[ $bad_roots == *" $root "* ]] && CARD_KH[$bdf]=$keep_hold
+		done
+	fi
+	# Every card first: arming is resolved (kept only where BAR1 has the target) before any driver may bind.
+	for bdf in "${LAYOUT_BDFS[@]}"; do
+		set_card "$bdf"
+		dev=$SYSPCI/$bdf
+		len=$(bar1_len "$dev")
+		kh=${CARD_KH[$bdf]:-}
+		if [ "$kh" = rollback-failed ]; then
+			log "$bdf state unknown after the failed rollback, 0x610 left as is; reboot required"
+			RESULT[$bdf]=unknown
+		elif [ "$kh" = unknown ]; then
+			log "$bdf state unknown after an unknown module outcome, 0x610 left as is; reboot required"
+			RESULT[$bdf]=unknown
+		elif [ "${R_LAYOUT[$bdf]}" != dryrun ] && [ "$len" = "$BYTES" ]; then
+			if [ "${LAYOUT_RESTORE[$bdf]}" = none ]; then
+				log "$bdf resized to $SIZE_TXT via the layout module (resize only, 0x610 untouched)"
+			else
+				log "$bdf armed and resized to $SIZE_TXT via the layout module"
+			fi
+			RESULT[$bdf]=enlarged
+		elif [ "${LAYOUT_RESTORE[$bdf]}" = none ]; then
+			if [ "${R_LAYOUT[$bdf]}" = dryrun ]; then
+				log "$bdf layout dry run only; left at its current $(mib "$len") MiB"
+			else
+				log "$bdf layout did not resize BAR1; left at its current $(mib "$len") MiB"
+			fi
+		elif disarm "$bdf" "${LAYOUT_RESTORE[$bdf]}"; then
+			if [ "${R_LAYOUT[$bdf]}" = dryrun ]; then
+				log "$bdf layout dry run only; disarmed, left at stock $(mib "$len") MiB"
+			else
+				log "$bdf layout did not resize BAR1; disarmed, left at stock $(mib "$len") MiB"
+			fi
+		else
+			log "$bdf layout did not resize BAR1 and disarm failed ($(disarm_failed "$bdf"))"
+		fi
+	done
+	# Then the driver hold: kept below the root ports of a failed batch, released everywhere else.
+	if [ -n "${CARD_KH[*]}" ]; then
+		local -a bad
+		read -r -a bad <<<"$bad_roots"
+		release "${bad[@]}"
+		log "driver hold kept on ${HELD[*]##*/}; to release the hold by hand after checking the cards (or reboot):"
+		log "  echo > /sys/bus/pci/devices/<fn>/driver_override; echo <fn> > /sys/bus/pci/drivers_probe (each held function)"
+	else
+		release
+	fi
+}
+
+# --- warnings about the install -------------------------------------------------------------------------------------
+install_warnings() {
+	local f leftovers=()
+	for f in "$R/etc/rebar-arm.conf" "$R/usr/local/sbin/rebar-arm.sh" "$R/etc/systemd/system/rebar-arm.service" "$OLD_OPT_FILE"; do
+		[ ! -e "$f" ] || leftovers+=("$f")
+	done
+	[ ${#leftovers[@]} = 0 ] || log "old 3080-20gb-rebar files still present: ${leftovers[*]}; run install.sh to migrate them"
+	# modprobe -c is what the driver gets; without an nvidia module installed it can omit the line, so the
+	# modprobe.d files are counted too
+	local n m d
+	n=$(modprobe -c 2>/dev/null | grep -c 'NVreg_RegistryDwordsPerDevice')
+	m=0
+	while IFS= read -r d; do
+		m=$((m + $(cat "$d"/*.conf 2>/dev/null | grep -cE '^[[:space:]]*options[[:space:]]+nvidia[[:space:]].*NVreg_RegistryDwordsPerDevice=')))
+	done < <(modprobe_dirs)
+	if [ "${n:-0}" -gt 1 ] || [ "$m" -gt 1 ]; then
+		log "warning: more than one NVreg_RegistryDwordsPerDevice line (modprobe -c: ${n:-0}, modprobe.d files: $m); only the last counts"
+		log "  sudo geforce-bar1-resize driver-option --write --adopt-driver-line merges them"
+	fi
+}
+
+write_state() {
+	local bdf tmp line
+	local -A old=()
+	[ ${#RESULT[@]} -gt 0 ] || return 0
+	mkdir -p "$RUN_DIR" 2>/dev/null || return 0
+	if [ -r "$RUN_DIR/cards" ]; then
+		while read -r bdf line; do [ -z "$bdf" ] || old[$bdf]=$line; done <"$RUN_DIR/cards"
+	fi
+	for bdf in "${!RESULT[@]}"; do old[$bdf]="${STATE_RT[$bdf]:-${R_ROUTE[$bdf]}} ${RESULT[$bdf]}"; done
+	tmp=$RUN_DIR/cards.$$
+	for bdf in "${!old[@]}"; do echo "$bdf ${old[$bdf]}"; done | sort >"$tmp" 2>/dev/null && mv "$tmp" "$RUN_DIR/cards" 2>/dev/null
+	rm -f "$tmp" 2>/dev/null
+	return 0
+}
+
+# --- boot -------------------------------------------------------------------------------------------------------------------
+declare -A S_610_OF STATE_RT
+cmd_boot() {
+	local dry=$1 bdf note order=() t
+	[ "$dry" = 0 ] || LOG_FILE=0
+	log "geforce-bar1-resize $GBR_VERSION sha256 $(sha256sum "$0" 2>/dev/null | cut -c1-12)${CONF_USED:+ config $CONF_USED}"
+	for note in "${NOTES[@]}"; do log "$note"; done
+	[ "$dry" = 1 ] || install_warnings
+	if [ -z "${CARDS// /}" ]; then log "CARDS is empty, nothing to do"; return 0; fi
+	load_record
+	# a dry run (install.sh's plan) runs while the driver is bound: plan bound cards as the next boot would see them
+	scope 0 "$dry"
+	if [ "$dry" = 1 ]; then for t in "${SCOPE[@]}"; do [ -z "${P_DRV[$t]}" ] || log "$t bound to ${P_DRV[$t]} now; planned as the next boot, before the driver binds"; done; fi
+	if [ ${#SCOPE[@]} = 0 ]; then log "no card to enlarge"; [ "$dry" = 0 ] || log "dry run: nothing was written"; return 0; fi
+	plan_scope 0
+	# largest target first, then BDF (fewer fragments in the 64-bit window)
+	while read -r t bdf; do order+=("$bdf"); done < <(for bdf in "${SCOPE[@]}"; do echo "$((${R_N[$bdf]:-0} + 0)) $bdf"; done | sort -k1,1nr -k2,2)
+	SIGNALLED=0
+	trap 'SIGNALLED=1' INT TERM HUP
+	for bdf in "${order[@]}"; do
+		if [ "$SIGNALLED" = 1 ]; then log "signal received; no further card is armed"; break; fi
+		[ -z "${R_SNOTE[$bdf]}" ] || log "$bdf ${R_SNOTE[$bdf]}"
+		[ -z "${R_SNOTE2[$bdf]}" ] || log "$bdf ${R_SNOTE2[$bdf]}"
+		local rt=${R_ROUTE[$bdf]} lr=${R_ROUTE[$bdf]}
+		[ "$rt" != none ] || { xve_check "$bdf" >/dev/null 2>&1; S_610_OF[$bdf]=$S_610; [ -n "$S_610" ] && [ $(((0x$S_610 >> 11) & 1)) = 1 ] && lr=0x610; }
+		[ -z "${R_HEAD[$bdf]}" ] || log "$bdf ${P_IDS[$bdf]} ($(label "$bdf" "$lr" "${R_N[$bdf]}")) ${R_HEAD[$bdf]}"
+		if [ "$dry" = 1 ]; then dry_card "$bdf"; else run_card "$bdf"; fi
+		[ -n "${RESULT[$bdf]:-}" ] || RESULT[$bdf]=stock
+		[ "$rt" != none ] || [ "$lr" != 0x610 ] || { RESULT[$bdf]=enlarged; STATE_RT[$bdf]=0x610; }
+		[ "$rt" != none ] || [ "$lr" = 0x610 ] || unset 'RESULT[$bdf]'
+	done
+	if [ "$dry" = 1 ]; then log "dry run: nothing was written"; return 0; fi
+	[ ${#LAYOUT_BDFS[@]} = 0 ] || layout_phase
+	write_state
+	# A signal must not leave a card armed at a stock BAR1 or drivers released onto an unresolved card: the trap only
+	# records it; the per-card loop stops arming further cards and the run above resolves everything, then exits 1.
+	# (SIGKILL cannot be caught; a reboot returns every card to stock.)
+	if [ "$SIGNALLED" = 1 ]; then
+		log "signal received; resolved the cards and the hold, exiting 1"
+		exit 1
+	fi
+}
+
+# --- check ------------------------------------------------------------------------------------------------------------------
+topology() { # BDF: path from the root port; sets SWITCH (yes/no)
+	local path rel rest cur comp n=0 s e f win vd
+	path=$(readlink -f "$SYSPCI/$1")
+	rel=${path#/sys/devices/} rest=${path#/sys/devices/*/}
+	cur=/sys/devices/${rel%%/*} SWITCH=no
+	while [[ $rest == */* ]]; do
+		comp=${rest%%/*} rest=${rest#*/} cur=$cur/$comp n=$((n + 1))
+		win="no prefetchable window"
+		if read -r s e f < <(sed -n 16p "$cur/resource" 2>/dev/null) && [ $((f & 0x200)) != 0 ] && [ $((e)) -gt $((s)) ]; then
+			win="prefetchable window $s..$e ($(((e - s + 1) >> 20)) MiB, $([ $((f & 0x100000)) != 0 ] && echo 64-bit || echo 32-bit))"
+		fi
+		vd="$(rd "$cur/vendor"):$(rd "$cur/device")"
+		echo "  path    $comp ${vd//0x/} $([ $n = 1 ] && echo "root port, ")$win"
+	done
+	[ "$n" -gt 1 ] && SWITCH=yes
+	[ "$n" -gt 0 ] || echo "  path    on a root bus, no root port above it"
+	echo "  switch  behind a PCIe switch: $SWITCH"
+	local root f
+	root=$(root_of "$1")
+	[ -n "$root" ] || return 0
+	while IFS= read -r f; do
+		[[ $(rd "$f/class") == 0x0604* ]] && continue
+		[ -e "$f/driver" ] && [ "${f##*/}" != "$1" ] && echo "  bound   ${f##*/} to $(basename "$(readlink -f "$f/driver")") (the layout module refuses this root port while a driver is bound)"
+	done < <(find "$root" -type d -name '[0-9a-f][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f].[0-7]' | sort)
+}
+vbios_of() {
+	local v=unknown info=$NVPROC/gpus/$1/information
+	if [ -r "$info" ]; then v=$(awk -F':[ \t]*' '/^Video BIOS/ {print $2}' "$info")
+	elif [ "${P_DRV[$1]}" = nvidia ] && command -v "$NVSMI" >/dev/null; then
+		v=$("$NVSMI" -i "$1" --query-gpu=vbios_version --format=csv,noheader 2>/dev/null) || v=unknown
+	fi
+	echo "${v:-unknown}"
+}
+driver_version() {
+	local v
+	v=$(grep -oE 'Kernel Module +[0-9.]+' "$NVPROC/version" 2>/dev/null | awk '{print $3}')
+	[ -n "$v" ] || v=$("$NVSMI" --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1)
+	if [[ $v =~ ^[0-9]+(\.[0-9]+)+$ ]]; then echo "$v"; fi # nvidia-smi prints its error text on stdout when no driver is loaded
+}
+cmd_check() {
+	local plan_=0 report=0 bdf fail=0 l rt lr s fb rows=() args=() m dv
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--vram) [ $# -ge 2 ] || { echo "check: --vram needs a value" >&2; exit 2; }
+				m=$(vram_mib "$2") && [ -n "$m" ] && [ "$m" -gt 0 ] || { echo "check: cannot parse VRAM size '$2'" >&2; exit 2; }
+				VRAM_ARG=$m; shift 2 ;;
+			--layout-plan) plan_=1; shift ;;
+			--report) report=1; shift ;;
+			-*) echo "check: unknown option $1" >&2; exit 2 ;;
+			*) args+=("$(norm_bdf "$1")"); shift ;;
+		esac
+	done
+	need_root check
+	command -v setpci >/dev/null || { echo "check: setpci not found (install pciutils)" >&2; exit 2; }
+	[ ${#args[@]} = 0 ] || CARDS="${args[*]}"
+	LOG_FILE=0
+	load_record
+	dv=$(driver_version)
+	[ "$CARDS" = auto ] || [ ${#args[@]} -gt 0 ] || true
+	local list=()
+	if [ ${#args[@]} -gt 0 ]; then list=("${args[@]}")
+	elif [ "$CARDS" = auto ]; then
+		for bdf in "$SYSPCI"/*; do [ "$(rd "$bdf/vendor")" = 0x10de ] && [[ $(rd "$bdf/class") == 0x030[02]* ]] && [ ! -e "$bdf/physfn" ] && list+=("${bdf##*/}"); done
+	else for bdf in $CARDS; do list+=("$(norm_bdf "$bdf")"); done; fi
+	[ ${#list[@]} -gt 0 ] || { echo "check: no NVIDIA display device found" >&2; exit 1; }
+	for bdf in "${list[@]}"; do
+		echo "== $bdf"
+		if [ ! -e "$SYSPCI/$bdf" ]; then echo "  FAIL device not present"; fail=1; continue; fi
+		probe "$bdf"
+		echo "  ids     ${P_IDS[$bdf]} class ${P_CLASS[$bdf]} driver ${P_DRV[$bdf]:-none} boot_vga $(rd "$SYSPCI/$bdf/boot_vga" || echo n/a)"
+		if [ -n "${P_REASON[$bdf]}" ]; then echo "  FAIL    not a candidate: ${P_REASON[$bdf]}"; fail=1; continue; fi
+		echo "  vBIOS   $(vbios_of "$bdf")"
+		echo "  ReBAR   capability $(ecap "$bdf" 0x15), BAR1 entry ${P_CAP[$bdf]}=${P_CAPV[$bdf]:-?} ${P_CTL[$bdf]}=$(setpci -s "$bdf" "${P_CTL[$bdf]}.L" 2>/dev/null), lists up to $(cap_max_mib "${P_CAPV[$bdf]:-0}") MiB"
+		echo "  BAR1    $(mib "${P_LEN[$bdf]}") MiB, resource1_resize ${P_MASK[$bdf]:-absent}"
+		xve_check "$bdf"
+		echo "  VSEC    0x600 $(setpci -s "$bdf" 0x600.L 2>/dev/null) 0x604 $(setpci -s "$bdf" 0x604.L 2>/dev/null) 0x60c $(setpci -s "$bdf" 0x60c.L 2>/dev/null) 0x610 ${S_610:-not read}"
+		for s in "${S_TXT[@]}"; do echo "  $s"; done
+		card_cfg "$bdf" "${P_IDS[$bdf]}"
+		for s in "${C_NOTES[@]}"; do echo "  note    $s"; done
+		[ -z "$C_FROM" ] || echo "  config  CARD[$C_FROM]"
+		plan "$bdf"
+		[ -z "${R_SNOTE[$bdf]}" ] || echo "  note    ${R_SNOTE[$bdf]}"
+		[ -z "${R_SNOTE2[$bdf]}" ] || echo "  note    ${R_SNOTE2[$bdf]}"
+		[ -z "${R_HEAD[$bdf]}" ] || echo "  size    ${R_HEAD[$bdf]}"
+		fb=$(fb_children "$bdf")
+		if is_console "$bdf"; then echo "  console yes (firmware framebuffer: ${fb:-none found in its BARs})"; else echo "  console no"; fi
+		topology "$bdf"
+		rt=${R_ROUTE[$bdf]} lr=$rt
+		[ "$rt" != none ] || { [ -n "$S_610" ] && [ $(((0x$S_610 >> 11) & 1)) = 1 ] && lr=0x610; }
+		l=$(label "$bdf" "$lr" "${R_N[$bdf]}")
+		echo "  label   $l$([ "$l" = untested ] && echo " (no compatibility report matches ${P_IDS[$bdf]} route $lr n=${R_N[$bdf]:-?}; docs/hardware.md)")"
+		[ -z "$dv" ] || [ "$dv" = "$VERIFIED_DRIVER" ] || echo "  note    driver $dv: RMForceStaticBar1=0 verified on $VERIFIED_DRIVER only"
+		set_card "$bdf" 2>/dev/null
+		case $rt in
+			none) echo "  PLAN    none: ${R_WHY[$bdf]}" ;;
+			resize)
+				echo "  PLAN    resize-only to $SIZE_TXT (0x610 never written)${R_BELOW[$bdf]:+; best effort}"
+				[ -z "${R_BELOW[$bdf]}" ] || printf '  note    %s\n' "${R_BELOW[$bdf]}" "${R_BELOW2[$bdf]}"
+				;;
+			0x610) echo "  PLAN    arm 0x610 VAL=$VAL, resize to $SIZE_TXT${R_WHY[$bdf]:+ (${R_WHY[$bdf]})}" ;;
+			skip) echo "  PLAN    skip: ${R_WHY[$bdf]}"; [ -z "${R_WHY2[$bdf]}" ] || echo "  note    ${R_WHY2[$bdf]}"; fail=1 ;;
+		esac
+		case ${R_DOPT[$bdf]}/$rt in
+			*/skip) ;;
+			off/*) echo "  driver  no RMForceStaticBar1=0 (driver_option=off)" ;;
+			*/0x610) echo "  driver  RMForceStaticBar1=0 (0x610 route; docs/driver-option.md)" ;;
+			on/resize | on/none) echo "  driver  RMForceStaticBar1=0 (driver_option=on)" ;;
+			auto/resize) echo "  driver  static BAR1 kept, no RMForceStaticBar1=0 (resize only; driver_option=on adds it)" ;;
+		esac
+		if [ "$SWITCH" = yes ] && [ "$rt" != none ] && [ "$rt" != skip ]; then
+			echo "  note    behind a PCIe switch: the plain resize usually fails with ENOSPC there"
+			echo "  note    LAYOUT=auto (install.sh --layout auto --layout-module) hands it to the layout module (experimental)"
+		fi
+		if [ "$report" = 1 ]; then
+			rows+=("| $( { "$NVSMI" -i "$bdf" --query-gpu=name --format=csv,noheader 2>/dev/null || true; } | head -n 1) | ${P_IDS[$bdf]} | $(vbios_of "$bdf") | ${Z_MIB:-?} MiB | $lr | ${R_N[$bdf]:-?} | $(mib "${P_LEN[$bdf]}") MiB | ${dv:-?} | $(uname -r) | $([ "$SWITCH" = yes ] && echo switch || echo direct) | $(is_console "$bdf" && echo yes || echo no) | <outcome> | <issue> | $(date +%F) |")
+		fi
+	done
+	if [ "$plan_" = 1 ]; then
+		local pl=() i
+		for bdf in "${list[@]}"; do case ${R_ROUTE[$bdf]:-} in resize | 0x610) pl+=("$bdf") ;; esac; done
+		echo "== layout plan (loads the $MODULE module with dry_run=1; writes nothing to any device)"
+		if [ ${#pl[@]} = 0 ]; then echo "  no card to plan"
+		elif ! modinfo "$MODULE" >/dev/null 2>&1; then echo "  $MODULE module not found for kernel $(uname -r); install.sh --layout-module builds it"; fail=1
+		else
+			for bdf in "${pl[@]}"; do R_LAYOUT[$bdf]=dryrun; done
+			make_batches "${pl[@]}"
+			for ((i = 0; i < B_N; i++)); do run_module "${B_TGT[i]}" "${B_IDX[i]}" 1 | sed 's/^[^ ]* /  /'; done
+		fi
+	fi
+	if [ "$report" = 1 ]; then
+		echo
+		echo "== compatibility report row (docs/hardware.md; fill in <outcome> and <issue>)"
+		echo "| card | id/subsys | vBIOS | VRAM | route | n | BAR1 | driver | kernel | topology | console | outcome | issue | date |"
+		echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+		printf '%s\n' "${rows[@]}"
+	fi
+	exit $fail
+}
+
+# --- record -------------------------------------------------------------------------------------------------------------------
+cmd_record() {
+	local only="" delay=0 out bus m dv bdf ids changed=0 swapped=0 tmp line drv=""
+	[ "${1:-}" != --delay ] || { delay=1; shift; }
+	only=${1:+$(norm_bdf "$1")}
+	# an SR-IOV virtual function has no VRAM record of its own: left alone without a line, as in discovery
+	if [ -n "$only" ] && [ -e "$SYSPCI/$only/physfn" ]; then return 0; fi
+	if [ ! -e "$NVPROC/version" ]; then
+		log "record: the nvidia driver is not loaded ($NVPROC/version absent); nothing recorded"
+		return 0
+	fi
+	# no nvidia-smi run for a card the record already holds with the same ids: it would hold the card right when
+	# bind-time tools (sriov-manage, a VFIO rebind, a driver reload) need the driver's unbind lock (a query for another
+	# card still covers every GPU). VRAM changes only with the hardware; `record` without BDF queries every card again
+	if [ -n "$only" ]; then
+		load_record
+		ids=$(ids_of "$only")
+		if [ "${REC_IDS[$only]:-}" = "$ids" ] && [ -n "${REC_MIB[$only]:-}" ]; then
+			log "record: $only $ids VRAM ${REC_MIB[$only]} MiB already recorded; nvidia-smi not run"
+			return 0
+		fi
+		if [ "$delay" = 1 ]; then
+			# the record unit starts at the bind, when tools that unbind right after the driver loads (sriov-manage,
+			# a VFIO rebind) are still running: let them finish, then only query a card still bound to nvidia
+			sleep "$RECORD_DELAY"
+			[ ! -e "$SYSPCI/$only/driver" ] || drv=$(basename "$(readlink -f "$SYSPCI/$only/driver")")
+			if [ "$drv" != nvidia ]; then
+				log "record: $only no longer bound to nvidia after ${RECORD_DELAY} s; nothing recorded"
+				return 0
+			fi
+		fi
+	fi
+	# bounded: a hung nvidia-smi would keep the cards open
+	out=$(timeout 60 "$NVSMI" --query-gpu=pci.bus_id,memory.total,driver_version --format=csv,noheader,nounits 2>/dev/null) ||
+		{ log "record: $NVSMI failed; nothing recorded"; return 0; }
+	mkdir -p "$STATE_DIR" || { log "record: cannot create $STATE_DIR"; return 1; }
+	if command -v flock >/dev/null; then exec 9>"$STATE_DIR/.lock" && flock 9; fi
+	load_record
+	while IFS=', ' read -r bus m dv _; do
+		[ -n "$bus" ] || continue
+		bus=${bus,,}
+		bdf=${bus: -12}
+		[ -z "$only" ] || [ "$bdf" = "$only" ] || continue
+		[[ $bdf =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] && [[ $m =~ ^[0-9]+$ ]] && [ -e "$SYSPCI/$bdf" ] ||
+			{ log "record: cannot use '$bus, $m, $dv'"; continue; }
+		ids=$(ids_of "$bdf")
+		[ "$dv" = "$VERIFIED_DRIVER" ] || log "record: $bdf driver $dv; RMForceStaticBar1=0 verified on $VERIFIED_DRIVER only"
+		if [ "${REC_IDS[$bdf]:-}" = "$ids" ] && [ "${REC_MIB[$bdf]:-}" = "$m" ] && [ "${REC_DRV[$bdf]:-}" = "$dv" ]; then continue; fi
+		if [ -n "${REC_IDS[$bdf]:-}" ] && [ "${REC_IDS[$bdf]}" != "$ids" ] && [ -z "${SWAP_OLD[$bdf]:-}" ]; then
+			SWAP_OLD[$bdf]=${REC_IDS[$bdf]} swapped=1
+			log "record: $bdf held ${REC_IDS[$bdf]} before: card swapped (noted in $SWAP_FILE)"
+			log "record: $bdf the new card does not inherit the old card's RMForceStaticBar1=0"
+		fi
+		REC_IDS[$bdf]=$ids REC_MIB[$bdf]=$m REC_DRV[$bdf]=$dv REC_DATE[$bdf]=$(date +%F)
+		log "record: $bdf $ids VRAM $m MiB, driver $dv"
+		changed=1
+	done <<<"$out"
+	# the swap first: with the new ids in the record and no note of the swap, a later rewrite would keep the old listing
+	if [ "$swapped" = 1 ]; then
+		tmp=$SWAP_FILE.$$
+		if ! {
+			echo "# Written by geforce-bar1-resize record; do not edit. Card swaps not yet applied to the driver option file: <bdf> <old ids>"
+			for bdf in "${!SWAP_OLD[@]}"; do echo "$bdf ${SWAP_OLD[$bdf]}"; done | sort
+		} >"$tmp" || ! mv "$tmp" "$SWAP_FILE"; then
+			rm -f "$tmp"
+			log "record: cannot write $SWAP_FILE"
+			return 1
+		fi
+	fi
+	if [ "$changed" = 1 ]; then
+		tmp=$VRAM_FILE.$$
+		if ! {
+			echo "# Written by geforce-bar1-resize record; do not edit. <bdf> <ids> <vram_mib> <driver> <date>"
+			for bdf in "${!REC_MIB[@]}"; do echo "$bdf ${REC_IDS[$bdf]} ${REC_MIB[$bdf]} ${REC_DRV[$bdf]} ${REC_DATE[$bdf]}"; done | sort
+		} >"$tmp" || ! mv "$tmp" "$VRAM_FILE"; then
+			rm -f "$tmp"
+			log "record: cannot write $VRAM_FILE"
+			return 1
+		fi
+	fi
+	# the option file follows the plan even when the record did not change (an unchanged file is left alone)
+	if [ "$DRIVER_OPTION" != off ] || [ ${#CARD[@]} -gt 0 ] || [ -e "$OPT_FILE" ]; then
+		( cmd_driver_option --write --quiet ) || log "record: driver-option --write did not complete (see above)"
+	fi
+	return 0
+}
+
+# --- repair -------------------------------------------------------------------------------------------------------------------
+cmd_repair() {
+	local bdf args=() len t cap
+	for bdf; do args+=("$(norm_bdf "$bdf")"); done
+	[ ${#args[@]} = 0 ] || CARDS="${args[*]}"
+	log "geforce-bar1-resize $GBR_VERSION repair"
+	load_record
+	scope 0 1
+	for bdf in "${SCOPE[@]}"; do
+		if [ -z "${P_DRV[$bdf]}" ]; then log "$bdf not bound; repair only touches bound cards, skip"; continue; fi
+		card_cfg "$bdf" "${P_IDS[$bdf]}"
+		# only a card the boot would arm through 0x610: not enable=no, route=skip or route=resize
+		if [ "$C_ENABLE" = no ]; then log "$bdf repair: enable=no in config, skip"; continue; fi
+		case $C_ROUTE in skip | resize) log "$bdf repair: route=$C_ROUTE in config, 0x610 is not this card's route; skip"; continue ;; esac
+		card_size "$bdf"
+		if [ -z "$Z_N" ]; then log "$bdf repair: ${Z_SKIP:-size unknown}, skip"; continue; fi
+		xve_check "$bdf"
+		if [ -n "$S_FAIL" ]; then log "$bdf repair: $S_FAIL; no 0x610 route on this card, nothing to repair"; continue; fi
+		R_N[$bdf]=$Z_N R_IDX[$bdf]=$((Z_N + 6)) R_VAL[$bdf]=$Z_N
+		set_card "$bdf"
+		len=${P_LEN[$bdf]:-0} t=$BYTES
+		if cap_wide "$bdf"; then log "$bdf bound; the capability lists $SIZE_TXT, nothing to repair"; continue; fi
+		if [ "$len" != "$t" ]; then
+			log "$bdf bound with BAR1 $(mib "$len") MiB, not the target; repair skips (would leave the driver and the hardware out of step)"
+		elif setpci -s "$bdf" "0x610.L=$SET" && cap_wide "$bdf"; then
+			cap=$(cap_read "$bdf")
+			log "$bdf bound; re-armed after reset, ${CAPREG[$bdf]} now $cap"
+		else
+			log "$bdf bound; re-arm after reset failed ($(disarm_failed "$bdf"))"
+		fi
+	done
+}
+
+# --- driver option (RMForceStaticBar1=0) ------------------------------------------------------------------------------------
+# user keys per card, in order, a repeated key keeping its last value; our RMForceStaticBar1=0 is not a user key
+declare -A UK
+add_keys() { # BDF "K=V;K=V;"
+	local bdf=$1 t k cur out c
+	local -a toks cs
+	IFS=';' read -r -a toks <<<"$2"
+	cur=${UK[$bdf]:-}
+	for t in "${toks[@]}"; do
+		t=${t//[[:space:]]/}
+		[ -n "$t" ] && [[ $t == *=* ]] || continue
+		[ "$t" != RMForceStaticBar1=0 ] || continue
+		k=${t%%=*}
+		if [[ ";$cur" == *";$k="* ]]; then
+			out=""
+			IFS=';' read -r -a cs <<<"$cur"
+			for c in "${cs[@]}"; do [ -z "$c" ] || { if [ "${c%%=*}" = "$k" ]; then out+="$t;"; else out+="$c;"; fi; }; done
+			cur=$out
+		else
+			cur+="$t;"
+		fi
+	done
+	UK[$bdf]=$cur
+}
+# per-device groups of the NVreg_RegistryDwordsPerDevice lines (not commented out) of a file: "bdf keys" lines
+groups_of() {
+	local f=$1 val t bdf="" keys=""
+	local -a toks
+	while IFS= read -r val; do
+		val=${val#*NVreg_RegistryDwordsPerDevice=}
+		if [[ $val == \"* ]]; then val=${val#\"} val=${val%%\"*}; else val=${val%%[[:space:]]*}; fi
+		IFS=';' read -r -a toks <<<"$val"
+		bdf="" keys=""
+		for t in "${toks[@]}"; do
+			t=${t//[[:space:]]/}
+			if [[ ${t,,} == pci=* ]]; then
+				[ -z "$bdf" ] || echo "$bdf $keys"
+				bdf=$(norm_bdf "${t#*=}") keys=""
+			elif [ -n "$t" ]; then
+				keys+="$t;"
+			fi
+		done
+		[ -z "$bdf" ] || echo "$bdf $keys"
+	done < <(grep -E '^[[:space:]]*options[[:space:]]+nvidia[[:space:]].*NVreg_RegistryDwordsPerDevice=' "$f" 2>/dev/null)
+}
+modprobe_dirs() {
+	if [ -n "${GBR_MODPROBE_DIR:-}" ]; then echo "$MODPROBE_DIR"; return; fi
+	local d seen=" " p
+	for d in "$R/etc/modprobe.d" "$R/run/modprobe.d" "$R/usr/local/lib/modprobe.d" "$R/usr/lib/modprobe.d" "$R/lib/modprobe.d"; do
+		[ -d "$d" ] || continue
+		p=$(readlink -f "$d")
+		[[ $seen != *" $p "* ]] || continue
+		seen+="$p "
+		echo "$d"
+	done
+}
+cmd_driver_option() {
+	local mode=print adopt=0 quiet=0 bdf line f d enl=() list=() content tmp stamp foreign=() g dv
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--print) mode=print ;;
+			--check) mode=check ;;
+			--write) mode="write" ;;
+			--adopt-driver-line) adopt=1 ;;
+			--quiet) quiet=1 ;;
+			*) echo "driver-option: unknown option $1" >&2; exit 2 ;;
+		esac
+		shift
+	done
+	need_root driver-option
+	say() { if [ "$quiet" = 1 ]; then log "driver-option: $*"; else echo "$*"; fi; }
+	foreign_line() { # file: names it, then its (first) NVreg_RegistryDwordsPerDevice line
+		say "foreign NVreg_RegistryDwordsPerDevice line in $1:"
+		say "  $(grep -E 'NVreg_RegistryDwordsPerDevice=' "$1" | grep -v '^[[:space:]]*#' | head -n 1)"
+	}
+	load_record
+	# cards to list: configured, qualifying, enlarged by plan or by this boot
+	scope 1 1
+	plan_scope 1
+	# the route each card took this boot (only cards it enlarged)
+	local -A boot=()
+	if [ -r "$RUN_DIR/cards" ]; then
+		while read -r bdf g line; do [ "$line" != enlarged ] || boot[$bdf]=$g; done <"$RUN_DIR/cards"
+	fi
+	# a card listed with our key before (this file, or the old one at migration) whose BAR1 is already at least the
+	# target was enlarged by us (route none): keep it listed, unless another card is there now: the VRAM record holds
+	# that address with other ids, or a record run replaced another card's record there and no rewrite has completed
+	# since ($SWAP_FILE). A card swapped in (for example a stock card whose firmware already gives a large BAR1) does not
+	# inherit the old card's key.
+	local -A prev=()
+	while read -r bdf line; do [[ ";$line" != *";RMForceStaticBar1=0;"* ]] || prev[$bdf]=1; done < <(groups_of "$OPT_FILE"; groups_of "$OLD_OPT_READ")
+	# driver_option auto: only cards enlarged through 0x610; resize only and best effort keep the driver's static BAR1
+	# (which some P2P setups need). on: every card with a large BAR1, also one the firmware already gave the target
+	for bdf in "${SCOPE[@]}"; do
+		g=${R_DOPT[$bdf]}
+		[ "$g" != off ] || continue
+		case ${R_ROUTE[$bdf]} in
+			0x610) enl+=("$bdf") ;;
+			resize) [ "$g" != on ] || enl+=("$bdf") ;;
+			none)
+				# auto: enlarged this boot through 0x610; else 0x610 armed (by this tool) with BAR1 at the target, or
+				# listed before
+				xve_check "$bdf"
+				if [ "$g" = on ]; then
+					enl+=("$bdf")
+				elif [ -n "${boot[$bdf]:-}" ]; then
+					[ "${boot[$bdf]}" != 0x610 ] || enl+=("$bdf")
+				elif { [ -z "$S_FAIL_NO5" ] && [ -n "$S_610" ] && [ $(((0x$S_610 >> 11) & 1)) = 1 ]; } ||
+					{ [ -n "${prev[$bdf]:-}" ] && [ "${REC_IDS[$bdf]:-${P_IDS[$bdf]}}" = "${P_IDS[$bdf]}" ] &&
+						[ "${SWAP_OLD[$bdf]:-${P_IDS[$bdf]}}" = "${P_IDS[$bdf]}" ]; }; then
+					enl+=("$bdf")
+				fi ;;
+			*) [ -z "${boot[$bdf]:-}" ] || { [ "$g" != on ] && [ "${boot[$bdf]}" != 0x610 ]; } || enl+=("$bdf") ;;
+		esac
+	done
+	# keys= from the config now, and the keys= the last write took from the config (its "# keys from config:" line):
+	# a key that came from keys= and is no longer there is dropped; keys added to the file by hand are kept
+	local -A cfgk=() lastk=()
+	for bdf in "${SCOPE[@]}"; do card_cfg "$bdf" "${P_IDS[$bdf]}"; [ -z "$C_KEYS" ] || cfgk[$bdf]=$C_KEYS; done
+	local t k
+	local -a toks
+	if line=$(sed -n 's/^# keys from config: //p' "$OPT_FILE" 2>/dev/null) && [ -n "$line" ]; then
+		read -r -a toks <<<"$line"
+		for t in "${toks[@]}"; do bdf=${t%%;*} bdf=${bdf#pci=}; lastk[$bdf]=${t#*;}; done
+	fi
+	while read -r bdf line; do
+		[ -n "$bdf" ] || continue
+		if [ -n "${lastk[$bdf]:-}" ]; then
+			local kept=""
+			IFS=';' read -r -a toks <<<"$line"
+			for t in "${toks[@]}"; do
+				[ -n "$t" ] || continue
+				k=${t%%=*}
+				if [[ ";${lastk[$bdf]}" == *";$k="* ]] && [[ ";${cfgk[$bdf]:-}" != *";$k="* ]]; then continue; fi
+				kept+="$t;"
+			done
+			line=$kept
+		fi
+		add_keys "$bdf" "$line"
+	done < <(groups_of "$OPT_FILE")
+	while read -r bdf line; do [ -z "$bdf" ] || add_keys "$bdf" "$line"; done < <(groups_of "$OLD_OPT_READ")
+	while IFS= read -r d; do
+		for f in "$d"/*.conf; do
+			[ -e "$f" ] && [ "$f" != "$OPT_FILE" ] && [ "$f" != "$OLD_OPT_FILE" ] || continue
+			if grep -Eq '^[[:space:]]*options[[:space:]]+nvidia[[:space:]].*NVreg_RegistryDwordsPerDevice=' "$f"; then
+				foreign+=("$f")
+				while read -r bdf line; do [ -z "$bdf" ] || [ "$adopt" = 0 ] || add_keys "$bdf" "$line"; done < <(groups_of "$f")
+			fi
+			if grep -Eq '^[[:space:]]*options[[:space:]]+nvidia[[:space:]].*NVreg_RegistryDwords=[^ ]*RMForceStaticBar1' "$f"; then
+				say "warning: $f sets RMForceStaticBar1 in the global NVreg_RegistryDwords"
+				say "  it applies to every GPU, the per-device line wins for the listed cards"
+			fi
+		done
+	done < <(modprobe_dirs)
+	# with --adopt-driver-line the foreign groups count as user keys; without, the merged line is only shown
+	if [ "$adopt" = 0 ]; then
+		for f in "${foreign[@]}"; do while read -r bdf line; do [ -z "$bdf" ] || add_keys "$bdf" "$line"; done < <(groups_of "$f"); done
+	fi
+	# keys= from the config win over the files and the foreign lines (adopted or only shown): apply them again last
+	for bdf in "${!cfgk[@]}"; do add_keys "$bdf" "${cfgk[$bdf]}"; done
+	for bdf in "${enl[@]}" "${!UK[@]}"; do [ -z "$bdf" ] || [[ " ${list[*]} " == *" $bdf "* ]] || list+=("$bdf"); done
+	mapfile -t list < <(printf '%s\n' "${list[@]}" | sed '/^$/d' | sort)
+	line=""
+	for bdf in "${list[@]}"; do
+		g="pci=$bdf;"
+		[[ " ${enl[*]} " != *" $bdf "* ]] || g+="RMForceStaticBar1=0;"
+		g+=${UK[$bdf]:-}
+		[ "$g" = "pci=$bdf;" ] || line+=$g
+	done
+	if [ -z "$line" ]; then
+		content=""
+	else
+		local fromcfg=""
+		for bdf in $(printf '%s\n' "${!cfgk[@]}" | sort); do fromcfg+="pci=$bdf;${cfgk[$bdf]} "; done
+		content="# Written by geforce-bar1-resize driver-option. One NVreg_RegistryDwordsPerDevice line for every card: a second
+# line anywhere in modprobe.d would replace this one. RMForceStaticBar1=0 turns off the NVIDIA driver's static BAR1
+# mapping, so host-visible allocations can reach almost all of VRAM (verified on driver $VERIFIED_DRIVER). By default
+# (DRIVER_OPTION=auto) only cards enlarged through 0x610 get it; resize-only cards keep static BAR1, which some P2P
+# setups need. Keys you add to a pci= group (e.g. RMDynBar1P2PEnable=0) are kept when the file is rewritten;
+# per-card keys= in /etc/geforce-bar1-resize.conf are added, and removed again when removed there (the line below
+# records them). Read at the next load of the nvidia module.${fromcfg:+
+# keys from config: ${fromcfg% }}
+options nvidia NVreg_RegistryDwordsPerDevice=\"$line\""
+	fi
+	[ ${#line} -le 1000 ] || say "warning: the option line is ${#line} characters; the driver's limit is about 1023"
+	if [ "$mode" = print ]; then
+		if [ -n "$content" ]; then printf '%s\n' "$content"; else echo "no card needs the driver option"; fi
+		for f in "${foreign[@]}"; do foreign_line "$f"; done
+		return 0
+	fi
+	if [ ${#foreign[@]} -gt 0 ] && [ "$adopt" = 0 ]; then
+		for f in "${foreign[@]}"; do foreign_line "$f"; done
+		say "not written: only one such line can take effect. The merged line would be:"
+		say "options nvidia NVreg_RegistryDwordsPerDevice=\"$line\""
+		say "rerun with --adopt-driver-line (install.sh --adopt-driver-line) to merge it and comment the other line out"
+		return 3
+	fi
+	if [ "$mode" = check ]; then
+		for f in "${foreign[@]}"; do say "foreign NVreg_RegistryDwordsPerDevice line in $f (merged, then commented out)"; done
+		if [ -n "$line" ]; then say "driver option: options nvidia NVreg_RegistryDwordsPerDevice=\"$line\""
+		else say "driver option: no card needs it"; fi
+		return 0
+	fi
+	stamp=$(date +%Y%m%d-%H%M%S)
+	backup() { # file
+		local b=$BACKUP_DIR/$stamp${1#"$R"}
+		mkdir -p "$(dirname "$b")" && cp -a "$1" "$b" && say "backed up $1 -> $b"
+	}
+	# the file written below applies the card swaps that record noted: remove the note
+	swaps_done() { [ ! -e "$SWAP_FILE" ] || { rm -f "$SWAP_FILE" && say "removed $SWAP_FILE: the card swaps it noted are applied"; }; }
+	for f in "${foreign[@]}"; do
+		backup "$f" || { say "cannot back up $f; nothing written"; return 1; }
+		sed -i -E 's/^([[:space:]]*options[[:space:]]+nvidia[[:space:]].*NVreg_RegistryDwordsPerDevice=)/# adopted by geforce-bar1-resize: \1/' "$f"
+		say "commented out the NVreg_RegistryDwordsPerDevice line in $f"
+		say "  (merged into $OPT_FILE)"
+	done
+	if [ -z "$content" ]; then
+		if [ -e "$OPT_FILE" ]; then
+			backup "$OPT_FILE" && rm -f "$OPT_FILE" && say "removed $OPT_FILE: no card needs the driver option"
+		else
+			say "no card needs the driver option; $OPT_FILE not written"
+		fi
+		[ -e "$OPT_FILE" ] || swaps_done
+		return 0
+	fi
+	if [ -e "$OPT_FILE" ] && [ "$(cat "$OPT_FILE")" = "$content" ]; then
+		say "unchanged $OPT_FILE"
+	else
+		[ ! -e "$OPT_FILE" ] || backup "$OPT_FILE" || { say "cannot back up $OPT_FILE; nothing written"; return 1; }
+		tmp=$OPT_FILE.tmp.$$
+		if ! mkdir -p "$MODPROBE_DIR" || ! printf '%s\n' "$content" >"$tmp" || ! chmod 0644 "$tmp" || ! mv "$tmp" "$OPT_FILE"; then
+			rm -f "$tmp"
+			say "cannot write $OPT_FILE"
+			return 1
+		fi
+		say "wrote $OPT_FILE: $line"
+		if [ -z "$R" ] && command -v lsinitramfs >/dev/null && lsinitramfs "/boot/initrd.img-$(uname -r)" 2>/dev/null | grep -qE '/nvidia\.ko'; then
+			say "note: the nvidia module is in the initramfs; run update-initramfs -u so the option applies at boot"
+		fi
+		say "the option applies at the next load of the nvidia module (reboot)"
+	fi
+	[ ${#enl[@]} = 0 ] || {
+		dv=$(driver_version)
+		[ -z "$dv" ] || [ "$dv" = "$VERIFIED_DRIVER" ] || say "driver $dv: RMForceStaticBar1=0 verified on $VERIFIED_DRIVER only"
+	}
+	swaps_done
+	return 0
+}
+
+case $SUB in
+	boot | plan)
+		DRY=0
+		[ "$SUB" = plan ] && DRY=1
+		while [ $# -gt 0 ]; do
+			case $1 in
+				--dry-run) DRY=1; shift ;;
+				--card) [ $# -ge 2 ] || { echo "boot: --card needs a selector" >&2; exit 2; }; SELECT+=("${2,,}"); shift 2 ;;
+				*) echo "boot: unknown option $1" >&2; exit 2 ;;
+			esac
+		done
+		need_root "$SUB"
+		cmd_boot "$DRY"
+		;;
+	check) cmd_check "$@" ;;
+	record) cmd_record "$@"; exit $? ;;
+	repair) cmd_repair "$@" ;;
+	driver-option) cmd_driver_option "$@"; exit $? ;;
+esac
+exit 0

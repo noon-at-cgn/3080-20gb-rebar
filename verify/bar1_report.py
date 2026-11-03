@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """BAR1 total/used/free per card from nvidia-smi and NVML (ctypes). Read-only."""
 import benchlib
 

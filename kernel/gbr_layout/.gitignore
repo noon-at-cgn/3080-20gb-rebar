@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Enlarge GeForce BAR1 to at least VRAM before the GPU driver binds
+DefaultDependencies=no
+After=systemd-journald.socket
+# geforce-sriov removes and rescans its cards before NVIDIA binds them: resize after it, so this run sees (and
+# checks) the card's final layout. No effect where geforce-sriov is not installed.
+After=geforce-sriov-prepare.service
+# before udev coldplug, which autoloads and binds drivers (nvidia, snd_hda_intel) to the cards
+Before=systemd-modules-load.service systemd-udev-trigger.service
+ConditionPathExists=/etc/geforce-bar1-resize.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/geforce-bar1-resize boot
+RemainAfterExit=yes
+TimeoutStartSec=60
+# SIGTERM (stop, start timeout) to the script only: it lets its setpci/sed helpers finish, then resolves every card
+# and the driver hold before it exits; the final SIGKILL still reaches every process.
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target

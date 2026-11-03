@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /* VRAM pattern check through the CUDA driver API, as a control for the BAR1 aperture tests.
  *
  * Usage: cuda_memcheck DDDD:BB:DD.F PERCENT_OF_FREE CHUNK_MIB

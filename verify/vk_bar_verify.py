@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Memtest-style pattern check of the DEVICE_LOCAL|HOST_VISIBLE (BAR1-backed) memory type
 (vk_bar_verify.c, built with gcc at run time; no Vulkan SDK needed). No config writes.
 

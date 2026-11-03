@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MIT
+# Started by /etc/udev/rules.d/90-geforce-bar1-resize.rules when the nvidia driver binds a card (instance = its PCI
+# address). Stores the card's VRAM size for the next boot, read-only towards the card. For a card already recorded
+# with the same ids no nvidia-smi runs (one run for another card queries every GPU and may still open it); another
+# card waits RECORD_DELAY seconds (default 60) first, so tools that unbind right after the driver loads (sriov-manage,
+# a VFIO rebind) get the driver's unbind lock, and is skipped if it left nvidia.
+# Type=exec: the start job ends when the script starts, so the wait holds neither boot nor udev.
+[Unit]
+Description=Record the VRAM size of %I for geforce-bar1-resize
+After=local-fs.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/sbin/geforce-bar1-resize record --delay %I
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# "A && B || C" is used on purpose as a guard (C is continue, break, a message or a fallback), never as
+# if-then-else.
+disable=SC2015

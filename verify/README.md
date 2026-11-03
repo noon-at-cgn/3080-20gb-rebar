@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: MIT -->
 # verify/
 
 Checks for a working 32 GiB BAR1. Run as root, once at stock and once armed, and compare with the table below.
@@ -9,8 +10,9 @@ Checks for a working 32 GiB BAR1. Run as root, once at stock and once armed, and
 | `vk_bar_verify.py` | Pattern test through the aperture: CPU writes through the mapping, GPU reads back, and the reverse | yes |
 | `cuda_memcheck.py` | Control: the same pattern by DMA, never through BAR1 | yes |
 
-Requirements: root, Python 3.8+, `gcc`, `nvidia-smi`, `journalctl`; `vulkaninfo` and the NVIDIA Vulkan driver for
-the Vulkan scripts; `libcuda.so.1` and `libnvidia-ml.so.1` (shipped with the driver). No SDK or toolkit is needed.
+Requirements: root, Python 3.8+, `gcc`, `nvidia-smi`, `journalctl`, `jq` (for the commands below); `vulkaninfo` and
+the NVIDIA Vulkan driver for the Vulkan scripts; `libcuda.so.1` and `libnvidia-ml.so.1` (shipped with the driver). No
+SDK or toolkit is needed.
 
 `vk_bar_verify.py` and `cuda_memcheck.py` refuse a card that any process holds or that is busy: stop every GPU
 user first (`fuser -v /dev/nvidia*` must print nothing).

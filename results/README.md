@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: MIT -->
 # Results
 
 Two memory-modded RTX 3080 20GB cards (`10de:2206`, vBIOS 94.02.27.00.14), NVIDIA driver 615.71.09, Linux 7.x.

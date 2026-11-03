@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Shared helpers for verify/*.py. Stdlib only; run as root on the machine with the cards.
 
 Nothing here writes PCI config space or sysfs. Run directly, this file prints the per-device header

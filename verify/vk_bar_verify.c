@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /* Memtest-style pattern check over DEVICE_LOCAL|HOST_VISIBLE Vulkan memory (the BAR1-backed type).
  *
  * Usage: vk_bar_verify DDDD:BB:DD.F CHUNK_MIB LIMIT_MIB SEED [PARENT_BDF]

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  stand-ins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck
+        run: shellcheck -x scripts/* install.sh uninstall.sh tests/*.sh
+      - name: Stand-in tests (no GPU, no root)
+        run: tests/run.sh

@@ -1,13 +1,12 @@
-# 3080-20gb-rebar: 32 GiB BAR1 on the memory-modded RTX 3080 20GB without flashing the vBIOS
+<!-- SPDX-License-Identifier: MIT -->
+# geforce-bar1-resize: BAR1 at least as large as VRAM on GeForce cards, without flashing
 
-For the memory-modded RTX 3080 20GB. On GA102, PCI config dword `0x610` holds a frame-buffer size override.
-Writing `00001c81` to it makes the GPU advertise a 32 GiB BAR1 (`0xbbc` reads `000ffc00`), and the kernel's sysfs
-ReBAR interface then resizes BAR1 to 32 GiB before the NVIDIA driver binds. Nothing is flashed to the GPU. The
-change is volatile (gone at power-off), so a small systemd service re-applies it at every boot. Reported VRAM is
-unchanged.
-
-> **Have a memory-modded RTX 4090 / 4090D 48GB and want a 64 GiB BAR1?** This method may work for you too; see
-> [Help wanted: RTX 4090 / 4090D 48GB](#help-wanted-rtx-4090--4090d-48gb-64-gib-bar1).
+On Turing and later GeForce cards, a boot service gives every card a BAR1 (the CPU's window into VRAM) at least as
+large as its VRAM, before the NVIDIA driver loads. Where the card's Resizable BAR capability already lists that size,
+it only resizes; where the list is too short (memory mods, capped vBIOS) and the card's config space has the known
+layout, it first sets the frame-buffer size override in PCI config space (`0x610`), the way NVIDIA's own ReBAR firmware
+does. A card with neither route gets the largest size its capability lists, logged as below VRAM. Nothing is flashed:
+the change is volatile, gone at power-off, and the service applies it again at every boot. Reported VRAM is unchanged.
 
 ## Disclaimer
 
@@ -15,207 +14,110 @@ unchanged.
 (see `LICENSE`). I am not responsible or liable for any damage, data loss, hardware
 failure, instability, downtime or voided warranty that results from using it.
 
-## Tested on
+## Status
 
-- The target: two memory-modded RTX 3080 20GB, `10de:2206`, subsystem `10de:146d`, vBIOS `94.02.27.00.14`
-- Any number of cards, each chosen by its full PCI address (`0000:01:00.0`); tested with two. Each card needs
-  32 GiB of 64-bit address space under its bridge.
-- NVIDIA proprietary driver 615.71.09
-- Linux 7.x with systemd
+| | Cards | Result |
+|---|---|---|
+| Verified | RTX 3080 20GB (memory-modded), `10de:2206` subsystem `10de:146d` | 32 GiB BAR1 via `0x610`, two cards on CPU root ports, display card included, warm and cold boots; on driver 615.71.09 and on the NVIDIA vGPU-KVM host driver 580.159.01 with SR-IOV VFs |
+| Untested | every other Turing-or-later GeForce card | enlarged automatically: resized where the card already lists the size, through `0x610` once the structural checks pass, otherwise to the largest size it lists; every write verified and undone on failure; the log marks the card `(untested)` |
 
-Other GA102 cards could work, since NVIDIA publishes the same register definitions for them, but they are
-untested. Stock cards with NVIDIA's own ReBAR vBIOS update do not need this.
+Reports and their outcomes: [docs/hardware.md](docs/hardware.md). The boot service works alongside an NVIDIA vGPU host
+with SR-IOV virtual functions (for example [geforce-sriov](https://github.com/noon-at-cgn/geforce-sriov)): it runs
+after the host's SR-IOV preparation unit, and the VFs and vGPU types are unaffected. Cards behind PCIe switches are
+experimental and off by default ([docs/pcie-switches.md](docs/pcie-switches.md)). What was tested, and how to run the
+tests: [docs/testing.md](docs/testing.md).
 
 ## Requirements
 
-- Root, `pciutils` (`setpci`, `lspci`), systemd.
+- Root, `pciutils` (`setpci`, `lspci`), bash and systemd.
 - A kernel that exposes `/sys/bus/pci/devices/<BDF>/resource1_resize`.
-- Above-4G decoding and room for each card's 32 GiB BAR1 in the 64-bit address space.
-- Cards directly on CPU root ports. Cards behind PCIe switches (for example PLX in multi-GPU servers) are not
-  supported yet: the firmware sizes the switch windows for 256 MiB BARs and Linux cannot grow them at runtime, so
-  the resize fails (see *Troubleshooting*).
+- Above-4G decoding and room in the 64-bit address space for each card's new BAR1 (32 GiB for a 20 GB card).
 - The NVIDIA driver loads from the root file system, after the service runs (not from the initramfs).
+- The card's VRAM size: recorded automatically once the NVIDIA driver has seen the card, or `size=` in the config.
 - A machine where a GPU or host hang is acceptable while you try it.
-
-## How it works
-
-The CPU reaches a GPU's memory through a PCI memory window called BAR1. A stock RTX 3080 20GB gets a 256 MiB
-window, so only a small slice of the 20 GB is visible at any moment and larger host-visible allocations fail.
-A bigger window is normally called Resizable BAR, and it has traditionally needed a new vBIOS, because the
-vBIOS decides which window sizes the card offers. Flashing is risky, and NVIDIA does not publish a ReBAR vBIOS
-for these memory-modded boards. This project skips the vBIOS: the operating system asks the card for the larger
-window at boot, in three steps.
-
-1. **Make the card offer 32 GiB.** GA102 has a frame-buffer size override in PCI config space at `0x610`. Writing
-   `00001c81` sets its enable bit (bit 11) and a size field of 9 (bits 10:7), meaning 64 MiB << 9 = 32 GiB. The
-   card's Resizable BAR capability (`0xbbc`) then lists sizes up to 32 GiB instead of 256 MiB (`00001c00` becomes
-   `000ffc00`). This is a config write, not a flash write. Nothing is stored on the card, so a power-off or reboot
-   returns it to stock, and the boot service writes it again.
-2. **Resize BAR1 while no driver is attached.** The kernel can only move and resize a BAR when no driver owns
-   the device, so the service runs before the NVIDIA driver loads. It writes size index 15 (1 MiB << 15 = 32 GiB)
-   to the card's `resource1_resize` file in sysfs, and the kernel re-assigns BAR1 inside the 32 GiB 64-bit
-   window. That needs Above-4G decoding and enough 64-bit MMIO space under the card's PCIe bridge.
-3. **Stop the driver from over-reserving it.** With a large BAR the NVIDIA driver switches to "static BAR1": it
-   maps VRAM into BAR1 up front and counts host-visible memory twice against it, so only about half of VRAM
-   (about 10 GiB) can be allocated for CPU access. Setting `RMForceStaticBar1=0` for the card (installed by
-   `install.sh`) returns to on-demand mapping, and about 98 % of VRAM becomes reachable.
-
-The vBIOS and flash are never written, and the card still reports 20 GB. What changes is how much of that memory
-the CPU can reach directly.
 
 ## Quick start
 
 ```sh
-lspci -Dnn -d 10de::0300                          # list NVIDIA GPUs with their IDs, e.g. 0000:01:00.0 ... [10de:2206]
-sudo scripts/rebar-check.sh --vram 20G            # read-only; must report that the preconditions hold
-sudo ./install.sh --bdfs "<address>" --enable     # writes /etc/rebar-arm.conf, the script, unit and driver option
+sudo scripts/geforce-bar1-resize check --vram 20G   # read-only: per card the checks, the label and the plan
+sudo ./install.sh --enable                          # prints the plan and asks
 sudo reboot
 ```
 
-Use the address of your own card from the first command; the ID in brackets should match *Tested on*. Without
-`--bdfs`, `install.sh` lists the cards it finds and asks which to arm.
-
-**Several cards:** separate the addresses with spaces inside one pair of quotes, not commas:
-`--bdfs "0000:01:00.0 0000:02:00.0"`. `/etc/rebar-arm.conf` (`REBAR_BDFS`) uses the same format. The driver line in
-the next section uses semicolons instead (`pci=<address>;RMForceStaticBar1=0;` per card); `install.sh` writes it.
-
-For the verified card the installer also sets the NVIDIA driver option that makes all of VRAM reachable through
-BAR1 (next section). `install.sh` leaves out the card that drives the display unless you pass
-`--include-console`; arm that card by hand once first (*Manual procedure*). `./install.sh --help` lists the other
-options (`--dry-run`, `--root DIR`, `--no-lift-ceiling`).
+`--vram` is your card's VRAM; once installed, `check` takes it from the record. `install.sh` reads VRAM from the
+loaded NVIDIA driver; if the driver was not loaded, the first boot records it and the next boot enlarges BAR1.
+`sudo ./install.sh --dry-run` shows everything it would do and changes nothing. The card that drives the console is
+included: its console is blank from the resize at boot until `nvidia-drm` (`fbdev=1`) or a display server takes over;
+`--console skip` leaves that card stock ([docs/console.md](docs/console.md)).
 
 ## Verify
 
 ```sh
-journalctl -b -u rebar-arm                     # <BDF> armed and resized to 32768 MiB
-lspci -vv -s <BDF> | grep "Region 1"           # [size=32G]: the real BAR1 size, the check that counts
-sudo setpci -s <BDF> 0x610.L 0xbbc.L           # 00001c81, 000ffc00
-sudo scripts/rebar-check.sh                    # also compares the real BAR1 size with the advertised one
+journalctl -b -u geforce-bar1-resize  # "<BDF> armed and resized to 32768 MiB", or "... (resize only, 0x610 untouched)"
+lspci -vv -s <BDF> | grep "Region 1"  # [size=32G]: the real BAR1 size, the check that counts
+sudo geforce-bar1-resize check <BDF>  # PLAN    none: BAR1 already 32768 MiB, skip
 ```
 
-Do not rely on `nvidia-smi` for this: its *BAR1 Total* follows the size the card advertises, so it can show
-32768 MiB while the real BAR1 is still 256 MiB.
+Do not rely on `nvidia-smi` for this: its *BAR1 Total* follows the size the card advertises, so it can show 32768 MiB
+while the real BAR1 is still 256 MiB. Deeper checks: `verify/README.md`.
 
-Deeper checks (pattern test through the aperture, CUDA control) are in `verify/README.md`.
+## Configuration
 
-## Driver option: all of VRAM through BAR1
+`/etc/geforce-bar1-resize.conf` (written by `install.sh`): `CARDS` (default: every NVIDIA display function with a
+Resizable BAR entry for BAR1, GeForce or not), `EXCLUDE`, `SIZE`, `ROUTE`, `LAYOUT`, `DRIVER_OPTION`, `CONSOLE`, and
+per-card `CARD[]` entries keyed by address or id. `install.sh` sets the same keys from the command line (`--cards`,
+`--exclude`, `--size`, `--route`, `--layout`, `--driver-option`, `--console`) and leaves the rest of the file alone;
+`sudo geforce-bar1-resize plan` logs what the next boot would do. The console card is included by default
+([docs/console.md](docs/console.md)).
 
-With the driver's default (static BAR1), only about half of VRAM is reachable as host-visible memory. For the
-verified card `install.sh` writes `/etc/modprobe.d/zz-nvidia-static-bar1.conf`, one entry per armed card:
+The driver option `RMForceStaticBar1=0` makes all of VRAM reachable through BAR1. By default it is written only for
+cards enlarged through `0x610`. Cards resized without it keep the driver's static BAR1, which some P2P setups need
+(stock RTX 50 BAR1 P2P, static-BAR1 P2P patches), unless `driver_option=on`
+([docs/driver-option.md](docs/driver-option.md)). All keys: [docs/configuration.md](docs/configuration.md); how it
+works: [docs/how-it-works.md](docs/how-it-works.md).
 
-```
-options nvidia NVreg_RegistryDwordsPerDevice="pci=0000:01:00.0;RMForceStaticBar1=0;pci=0000:02:00.0;RMForceStaticBar1=0;"
-```
+## Upgrading from 3080-20gb-rebar
 
-| Driver setting | Host-visible VRAM reachable per card (20480 MiB) |
-|---|---|
-| default | about 10.2 GiB |
-| `RMForceStaticBar1=0` | about 20.0 GiB (about 98 %) |
+Run `sudo ./install.sh` from this repository. It migrates the old install: the same cards and size, your driver keys
+(such as `RMDynBar1P2PEnable=0`), the unit's drop-ins and its enabled state; the old files go to
+`/var/backups/geforce-bar1-resize/`. If it is interrupted, run it again; it finishes the migration. Details:
+[docs/migration.md](docs/migration.md).
 
-- **Rule:** list every card in that one line; never also set the global `NVreg_RegistryDwords` option.
-- **Turn it off:** install with `--no-lift-ceiling`, or delete the file and reboot. Other cards get it only with
-  `--lift-ceiling`.
-- **Caveat:** nvidia-smi *BAR1 Used* no longer tracks VRAM use.
-
-## Next step: GPU-to-GPU P2P
-
-With the 32 GiB BAR1 and `RMForceStaticBar1=0` from this repo in place, two or more of these cards can copy directly
-to each other (peer-to-peer) with the patched NVIDIA open kernel modules in
-[3080-20g-p2p](https://github.com/noon-at-cgn/3080-20g-p2p). On the tested pair it measured 10.27 GB/s one way
-(5.78 GB/s without P2P) and made vLLM tensor-parallel prefill 6-10 % faster.
-
-## Results
-
-| Measurement | Result |
-|---|---|
-| BAR1 | 256 → 32768 MiB |
-| `0x610` / `0xbbc` | `00001001` → `00001c81` / `00001c00` → `000ffc00` |
-| Pattern test through the aperture | default driver setting: about 10.2 GiB per card; `RMForceStaticBar1=0`: about 20.0 GiB (about 98 % of 20480 MiB); 0 mismatches |
-| 512 MiB host-visible allocation | fails at 256 MiB BAR1, succeeds at 32 GiB |
-| Xid / AER | 0 / 0 in all runs |
-| Inference decode | about 78 tok/s at stock, about 80 tok/s at 32 GiB (no measurable difference) |
-| CPU write through BAR1 | about 9.6 GB/s with a busy GPU (follows the PCIe link speed) |
-| Persistence | re-armed at every boot; verified at warm reboots and cold power cycles |
-
-Test commands: `results/README.md`.
-
-## Manual procedure (per card, as root)
-
-1. Stop every GPU user; `fuser -v /dev/nvidia*` must print nothing.
-2. If the card drives the display (`boot_vga` is `1`), detach the console or the unbind hangs:
-   `echo 0 > /sys/class/vtconsole/vtcon1/bind` (the vtcon whose `name` is `(M) frame buffer device`).
-3. `echo $BDF > /sys/bus/pci/drivers/nvidia/unbind`
-4. `setpci -s $BDF 0x610.L=00000c80:00000f80` (bits 11:7 only), then check `0x610` = `00001c81` and `0xbbc` = `000ffc00`.
-5. `echo 15 > /sys/bus/pci/devices/$BDF/resource1_resize` (15 is the size index for 32 GiB, not bytes).
-6. `echo $BDF > /sys/bus/pci/drivers/nvidia/bind`, then reattach the console if you detached it:
-   `echo 1 > /sys/class/vtconsole/vtcon1/bind`.
-
-**Rollback without a reboot:** steps 1-3, then shrink first, `echo 8 > /sys/bus/pci/devices/$BDF/resource1_resize`,
-and only then `setpci -s $BDF 0x610.L=00001001:00000f80`; rebind and reattach the console. Do not disarm `0x610`
-while BAR1 is still 32 GiB.
-
-## Uninstall and rollback
+## Uninstall
 
 ```sh
 sudo ./uninstall.sh   # or --dry-run
-sudo reboot           # BAR1 is back to 256 MiB after the reboot
+sudo reboot           # BAR1 is back to stock after the reboot
 ```
 
-`uninstall.sh` disables the service and moves its files, including the driver option file, into
-`/var/backups/rebar-arm/`. Until the reboot, BAR1 stays at 32 GiB; to undo it live, use the rollback above.
-After a GPU reset (FLR) `0x610` may be cleared while BAR1 stays at 32 GiB; `sudo rebar-arm.sh --repair` re-arms it
-(manual command, nothing runs it automatically). A real FLR has not been tested: `--repair` has only been run
-against stand-ins and on healthy cards.
-
-## Troubleshooting
-
-| Problem | Fix |
-|---|---|
-| `echo ... > resource1_resize` fails with `EINVAL` | Write the size index, not bytes: `15` for 32 GiB. |
-| `0xbbc` does not change to `000ffc00` after arming | Run `scripts/rebar-check.sh`. If `0x60c` bit 11 is set and it still does not widen, the card may not support it; please report it. |
-| Journal says `already bound to nvidia, skip`, BAR1 is 256 MiB | The driver bound first. Enable the unit and keep the NVIDIA driver out of the initramfs. |
-| Unbind hangs or the screen goes blank on the display card | Detach the console first (step 2). `install.sh` leaves this card out unless `--include-console`. |
-| Host-visible allocations fail at about half of VRAM | The driver option is missing: check `/etc/modprobe.d/zz-nvidia-static-bar1.conf` lists the card (installed by default for the verified card, `--lift-ceiling` for others), then reboot. |
-| CPU writes through BAR1 drop to 5 or 2.4 GB/s on an idle GPU | The idle GPU lowers its PCIe link speed. With persistence mode on (`nvidia-smi -pm 1`), lock the memory clock around large uploads: `nvidia-smi -i <BDF> -lmc <max>,<max>`, then `-rmc`. |
-| Journal says `resize failed ... disarmed` (older versions: `armed but resize failed`); `lspci` shows `[size=256M]` | Linux could not fit the 32 GiB BAR1, usually because the card sits behind a PCIe switch whose window the firmware sized for 256 MiB (`dmesg` shows `cannot fit ... required for`). The service undoes the arming, so the card runs as stock. Older versions left it armed: update and reboot. Switch setups are not supported yet. |
+Until the reboot BAR1 stays enlarged; the live rollback is in [docs/manual-procedure.md](docs/manual-procedure.md).
+Uninstall removes the udev rule first and stops a record unit that is still waiting, so nothing writes the record or
+the option file again. Your own driver keys in the option file (such as `RMDynBar1P2PEnable=0`) stay, and uninstall
+prints where ([docs/driver-option.md](docs/driver-option.md#uninstall)). Problems:
+[docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Reporting compatibility
 
-Run `sudo scripts/rebar-check.sh --vram <SIZE>` (read-only) and open an issue with the *Compatibility report*
-template, including its output.
+Run `sudo geforce-bar1-resize check --report` (read-only; before installing,
+`sudo scripts/geforce-bar1-resize check --report --vram <SIZE>`) and open an issue with the *Compatibility report*
+template, including its output. Owners of a memory-modded RTX 4090 / 4090D 48GB: see
+[docs/hardware.md](docs/hardware.md#help-wanted-rtx-4090--4090d-48gb-64-gib-bar1).
 
-### Help wanted: RTX 4090 / 4090D 48GB (64 GiB BAR1)
+## GPU-to-GPU P2P
 
-The memory-modded 48GB 4090 and 4090D cap BAR1 at 32 GiB, less than their VRAM. Their vBIOS uses the same `0x610`
-register as the 3080, and NVIDIA's own 48GB AD102 cards (L40S, RTX 6000 Ada) ship with 64 GiB. Whether AD102
-accepts the write from the host is untested. If you have one on Linux, run this as root with the card idle and not
-driving the display (a power-off undoes it; nothing is flashed):
+With BAR1 enlarged and `RMForceStaticBar1=0` in place, cards can copy directly to each other with the patched NVIDIA
+open kernel modules in [geforce-dynbar1-p2p](https://github.com/noon-at-cgn/geforce-dynbar1-p2p) (verified on RTX
+3080 20GB pairs).
 
-```sh
-BDF=0000:01:00.0                                  # your card, from lspci -Dnn -d 10de::0300
-setpci -s $BDF 0x60c.L 0x610.L 0xbbc.L 0xdcc.L
-echo $BDF > /sys/bus/pci/drivers/nvidia/unbind
-setpci -s $BDF 0x610.L=00000d00:00000f80          # size field 10 = 64 GiB
-setpci -s $BDF 0x610.L 0xbbc.L                    # works if: 00001d01 001ffc00
-echo $BDF > /sys/bus/pci/drivers/nvidia/bind
-```
+## Credits
 
-If the last read shows `00001d01 001ffc00`, an optional second step resizes BAR1 to 64 GiB (also untested):
-
-```sh
-echo $BDF > /sys/bus/pci/drivers/nvidia/unbind
-echo 16 > /sys/bus/pci/devices/$BDF/resource1_resize   # 16 = 64 GiB; "No space left" = address window too small
-lspci -vv -s $BDF | grep 'Region 1'                     # expect [size=64G]
-# if anything looks wrong, before rebinding: echo 15 > /sys/bus/pci/devices/$BDF/resource1_resize
-echo $BDF > /sys/bus/pci/drivers/nvidia/bind
-nvidia-smi -q -d MEMORY | grep -A1 BAR1                  # expect Total 65536 MiB
-```
-
-The slot needs room for a 64 GiB-aligned BAR1 in the 64-bit address space (Above 4G Decoding on); if there isn't, the
-resize fails with "No space left on device". To keep it across reboots,
-`install.sh --n 10 --force --lift-ceiling --enable` arms it at every boot and sets the driver option (untested). Open
-an issue with all the output, `lspci -nn`, the vBIOS version and the board, whether it worked or not.
+The technique for laying out the windows behind a PCIe switch was first shown by `tools/server-161-bar1-layout` in
+[gu64](https://github.com/84634E1A607A/gpu-unlock-4090-48g-64g-bar1), for one fixed server. `gbr_layout` is an
+independent, generic implementation.
 
 ## Licence
 
-MIT, see `LICENSE`.
+MIT, see `LICENSE`. The kernel module in `kernel/gbr_layout` is dual-licensed `GPL-2.0-only OR MIT`. Every file
+carries its SPDX identifier; licence texts are in `LICENSES/`.
+
+Not affiliated with or endorsed by NVIDIA. NVIDIA and GeForce are trademarks of NVIDIA Corporation.

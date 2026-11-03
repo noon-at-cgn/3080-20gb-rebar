@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: MIT
+# When the nvidia driver binds a card, record its VRAM size for geforce-bar1-resize (the next boot sizes BAR1 from
+# it). systemd acts on SYSTEMD_WANTS only when a device first appears, and the bind comes after that, so the unit is
+# started directly; --no-block keeps udev from waiting for it. SR-IOV virtual functions (a physfn link) have no VRAM
+# record of their own and are left out.
+ACTION=="bind", SUBSYSTEM=="pci", DRIVER=="nvidia", TEST!="physfn", RUN+="/bin/systemctl --no-block start geforce-bar1-resize-record@$kernel.service"

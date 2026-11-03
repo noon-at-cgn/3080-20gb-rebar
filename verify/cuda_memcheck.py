@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """VRAM pattern check via the CUDA driver API (cuda_memcheck.c, built with gcc at run time; no CUDA
 toolkit needed). Control for the BAR1 aperture test: it writes a unique per-word pattern into most
 of free VRAM with DMA copies (cuMemcpyHtoD) and reads it back (cuMemcpyDtoH), never through BAR1.

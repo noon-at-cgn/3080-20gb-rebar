@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: MIT
+# /etc/geforce-bar1-resize.conf, sourced by geforce-bar1-resize (bash syntax). The boot unit only runs when this file
+# exists. Every key is optional; the values below are the defaults. Details: docs/configuration.md.
+
+# Which cards: auto = every NVIDIA display function (class 0300/0302) with a Resizable BAR capability, or an explicit
+# list of full PCI addresses ("0000:01:00.0 0000:02:00.0").
+CARDS=auto
+
+# Never touched: full PCI addresses, vendor:device or vendor:device/subvendor:subdevice, space-separated.
+EXCLUDE=""
+
+# BAR1 size: auto = the smallest 64 MiB << n at least as large as the card's VRAM (from the record that
+# `geforce-bar1-resize record` writes once the NVIDIA driver has seen the card), or 0..13 (n), or 64M..512G.
+SIZE=auto
+
+# auto: resize only if the capability already lists the size, else arm the 0x610 override if the structural checks
+# pass, else, if the card lists a size above its BAR1, resize to the largest listed size (best effort, logged as below
+# VRAM), else skip. resize: never write 0x610. 0x610: always the override (still needs the checks). 0x610!: the
+# override also when S5 (ReBAR layout check) is the only failed check, for cards whose ReBAR capability sits
+# elsewhere; untested, use it only with `check --report` output in hand. skip: nothing.
+ROUTE=auto
+
+# Cards behind a PCIe switch (experimental): off | auto (gbr_layout module after an ENOSPC/ENOENT resize) |
+# dryrun (plan only) | force (always the module).
+LAYOUT=off
+
+# Driver option RMForceStaticBar1=0 (/etc/modprobe.d/zz-geforce-bar1-resize.conf, written by
+# `geforce-bar1-resize driver-option --write`): auto = only cards enlarged through 0x610 | on = every card with a large
+# BAR1 | off. Resize-only cards keep the driver's static BAR1 under auto, because some P2P setups (stock RTX 50 BAR1
+# P2P, static-BAR1 P2P patches) need it. Verified on driver 615.71.09 only.
+DRIVER_OPTION=auto
+
+# The card that drives the console: include (the kernel removes the firmware framebuffer before the resize; the
+# console comes back with nvidia-drm fbdev or a display server) | skip (leave it stock). A 3D-controller (0302)
+# function with a firmware framebuffer inside its BARs is always skipped. docs/console.md.
+CONSOLE=include
+
+LOG=/var/log/geforce-bar1-resize.log
+
+# Seconds the record unit waits after the nvidia driver binds a card it has no record for (or one recorded with other
+# ids), before nvidia-smi opens it: tools that unbind right after the driver loads (sriov-manage, a VFIO rebind) need
+# the driver's unbind lock first; a card no longer bound to nvidia then is not queried. 0..3600. The record unit runs
+# no nvidia-smi for a card already recorded with the same ids (its query for another card, or `record` without an
+# address as install.sh runs it, may still open it).
+RECORD_DELAY=60
+
+# Per-card settings; the first matching entry wins: a full PCI address (with ids= in the entry, those must match the
+# card there), then vendor:device/subvendor:subdevice, then vendor:device. Keys: enable=yes|no size= route= layout=
+# ids= driver_option=auto|on|off console=include|skip keys= (more driver registry keys for this card, each K=V;
+# e.g. RMDynBar1P2PEnable=0;).
+declare -A CARD=(
+#	[0000:01:00.0]="size=16G"
+#	[0000:02:00.0]="enable=no"
+#	[10de:2684]="size=64G"
+#	[10de:2684/1458:4105]="route=skip"
+)

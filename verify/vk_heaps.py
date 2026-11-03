@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Vulkan memory heaps per GPU from `vulkaninfo`. Primary signal: the size of the heap that carries a
 DEVICE_LOCAL|HOST_VISIBLE memory type. On NVIDIA it is a separate ~256 MiB-class heap with a small BAR1
 and becomes the whole VRAM heap when BAR1 covers VRAM. Read-only."""

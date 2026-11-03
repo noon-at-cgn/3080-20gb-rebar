@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+obj-m := gbr_layout.o
+
+# Compatibility check against the target kernel's headers, not LINUX_VERSION_CODE: distribution kernels
+# backport PCI changes. pci_release_resource() returns void on 6.14 and int on 7.0.
+rl_release_int := $(shell grep -Eqs '^int pci_release_resource.struct pci_dev' $(srctree)/include/linux/pci.h && echo y)
+ifeq ($(rl_release_int),y)
+ccflags-y += -DRL_RELEASE_INT
+endif
+# The allocate_resource() alignf callback gained an empty_res argument after 7.0 (master).
+rl_alignf_empty := $(shell grep -qs 'const struct resource \*empty_res' $(srctree)/include/linux/ioport.h && echo y)
+ifeq ($(rl_alignf_empty),y)
+ccflags-y += -DRL_ALIGNF_EMPTY_RES
+endif
+
+# The module logs this, so a test run records exactly which source it loaded.
+rl_src := $(shell sha256sum $(src)/gbr_layout.c 2>/dev/null | cut -c1-12)
+ifneq ($(rl_src),)
+ccflags-y += -DRL_SRC=\"$(rl_src)\"
+endif
+
+# make TEST=1: test-only parameters (fake targets, fault injection). Never in a release build.
+ifeq ($(TEST),1)
+ccflags-y += -DGBR_LAYOUT_TEST
+endif
