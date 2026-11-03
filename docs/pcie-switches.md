@@ -6,16 +6,16 @@ silicon forced on a CPU root port (no switch), but not yet on real switch hardwa
 shipped config and in the installer: nothing here runs unless you turn it on with `install.sh --layout auto` (or
 `LAYOUT=auto` in `/etc/geforce-bar1-resize.conf`, with the module built).
 
-Behind a PCIe switch the plain resize fails with `No space left on device` (`No such file or directory` on 6.14-era
-kernels): the firmware sized the switch windows for 256 MiB BARs, and Linux only grows the window directly above the
-card. With `LAYOUT=auto` the service then loads the `gbr_layout` kernel module (`kernel/gbr_layout`), which lays out
-every 64-bit prefetchable window and BAR below the card's root port again. It runs while no driver is bound: the
-service holds every function below the root ports with `driver_override` until it is done. The module plans the
-whole layout and checks that it fits the host bridge before it writes anything, then moves the windows and BARs,
-checks each one against config space, and on any failure restores every saved register and resource. It works one
-root port at a time; after a failure the remaining root ports are skipped, and those already done keep their new
-layout. The module takes one size index and at most 4 root ports per load, so the service runs it in batches (one
-per size, at most 4 root ports each) under one driver hold, and resolves every card before it releases the hold.
+Behind a PCIe switch the plain resize fails with `No space left on device` (`No such file or directory` on some kernels,
+for example 6.14): the firmware sized the switch windows for the BARs the cards had at boot, and Linux only grows the
+window directly above the card. With `LAYOUT=auto` the service then loads the `gbr_layout` kernel module
+(`kernel/gbr_layout`), which lays out every 64-bit prefetchable window and BAR below the card's root port again. It runs
+while no driver is bound: the service holds every function below the root ports with `driver_override` until it is done.
+The module plans the whole layout and checks that it fits the host bridge before it writes anything, then moves the
+windows and BARs, checks each one against config space, and on any failure restores every saved register and resource.
+It works one root port at a time; after a failure the remaining root ports are skipped, and those already done keep
+their new layout. The module takes one size index and at most 4 root ports per load, so the service runs it in batches
+(one per size, at most 4 root ports each) under one driver hold, and resolves every card before it releases the hold.
 Like the resize, all of it is volatile: a reboot returns the firmware's layout, and the service runs again.
 
 ## Requirements
@@ -23,11 +23,14 @@ Like the resize, all of it is volatile: a reboot returns the firmware's layout, 
 - The layout module: `install.sh --layout auto` builds it for the running kernel when a selected card sits behind a
   switch (`--layout-module` builds it in any case; it needs the kernel headers, and with DKMS it is rebuilt for every
   new kernel).
-- Each root port needs one 64-bit window for all of its cards, aligned to the card's BAR1 size. With one card per
-  switch port that is (2 × cards − 1) × BAR1 size plus 32 MiB, because each card's 32 MiB second BAR pushes the next
-  card to the next aligned slot: 96 GiB for two 32 GiB cards, 288 GiB for five. The firmware's 64-bit MMIO range must
-  have that much free space (Supermicro: *MMIOH Base* and *MMIO High Size*); `geforce-bar1-resize check --layout-plan`
-  prints the exact size.
+- Each root port gets one 64-bit prefetchable window for all the cards below it. The module places each card's BAR1 at
+  an address aligned to its size, together with the cards' other 64-bit prefetchable BARs. A card with such a BAR
+  besides BAR1 makes its switch port's window larger than BAR1, so the next card starts at the next BAR1-aligned
+  address, and the root port's window can need close to twice the sum of the BAR1 sizes.
+  `geforce-bar1-resize check --layout-plan` prints the exact size and alignment per root port (its
+  `root <port> window 0x... align 0x...` line). The firmware must leave that much free, aligned space in the host
+  bridge's 64-bit MMIO range: turn on Above-4G decoding and give that range enough room (the BIOS options that set its
+  size and base have vendor-specific names).
 
 ## Trying it safely
 

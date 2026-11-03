@@ -30,7 +30,8 @@ no driver owns the cards yet. For each card:
    ids, so it does not follow a VRAM change that keeps the ids (a memory mod, a swap for a card with the same ids):
    run `sudo geforce-bar1-resize record`, which without an address queries every card again, then reboot.
 3. **Route:**
-   - *none*: BAR1 is already at least the target (stock Ada cards, ReBAR firmware). BAR1 is never shrunk.
+   - *none*: BAR1 is already at least the target (for example when the system firmware's Resizable BAR support or ReBAR
+     firmware already enlarged it). BAR1 is never shrunk.
    - *resize only*: the capability already lists a size at least the target; BAR1 is resized to the smallest such
      size through `resource1_resize`, and `0x610` is never written.
    - *0x610*: the card passes the structural checks below; the frame-buffer size override in config space is
@@ -77,15 +78,15 @@ lines `(verified)`, `(reported)` or `(untested)`; it never decides whether a car
 
 ## Driver option
 
-With a large BAR the NVIDIA driver switches to "static BAR1" and only about half of VRAM can be allocated for CPU
-access. `RMForceStaticBar1=0` turns that off; by default (`DRIVER_OPTION=auto`) it is written only for cards enlarged
-through `0x610`. Resize-only and best-effort cards keep static BAR1, which some P2P setups (stock RTX 50 BAR1 P2P,
-static-BAR1 P2P patches) need; `driver_option=on` adds it for them: [driver-option.md](driver-option.md).
+With a large BAR the NVIDIA driver switches to "static BAR1", which limits CPU-accessible allocations (to about half of
+VRAM on the RTX 3080 20GB). `RMForceStaticBar1=0` turns that off; by default (`DRIVER_OPTION=auto`) it is written only
+for cards enlarged through `0x610`. Resize-only and best-effort cards keep static BAR1, which some P2P setups (stock RTX
+50 BAR1 P2P, static-BAR1 P2P patches) need; `driver_option=on` adds it for them: [driver-option.md](driver-option.md).
 
 ## Cards behind PCIe switches
 
-Behind a switch the plain resize fails (`ENOSPC`, or `ENOENT` on 6.14-era kernels). With `LAYOUT=auto` such cards go
-to the `gbr_layout` kernel module, which lays out the windows below the root port again:
+Behind a switch the plain resize fails (`ENOSPC`, or `ENOENT` on some kernels, for example 6.14). With `LAYOUT=auto`
+such cards go to the `gbr_layout` kernel module, which lays out the windows below the root port again:
 [pcie-switches.md](pcie-switches.md).
 
 ## Other subcommands

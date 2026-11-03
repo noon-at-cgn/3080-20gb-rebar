@@ -5,9 +5,9 @@ The card that drives the console (`boot_vga` = 1, or a firmware framebuffer insi
 
 - **VGA-class card (`0300`):** writing `resource1_resize` makes the kernel remove the firmware framebuffer
   (simpledrm, simplefb, efifb, vesafb) and vgacon on that card before it turns memory decode off and resizes, even if
-  the resize then fails (`drivers/pci/pci-sysfs.c`, `aperture_remove_conflicting_pci_devices()`; the same in 6.6,
-  6.14, 6.18 and 7.x). The console is blank from the resize until `nvidia-drm` (with `fbdev=1`) or a display server
-  takes over. The journal says `console card: the kernel removes the firmware framebuffer (...) before the resize`.
+  the resize then fails (`drivers/pci/pci-sysfs.c`, `aperture_remove_conflicting_pci_devices()`; checked in 6.6, 6.14,
+  6.18 and 7.x). The console is blank from the resize until `nvidia-drm` (with `fbdev=1`) or a display server takes
+  over. The journal says `console card: the kernel removes the firmware framebuffer (...) before the resize`.
 - **3D-controller function (`0302`) with a firmware framebuffer inside one of its BARs:** always skipped, without an
   override: nothing would remove the framebuffer, which would keep writing to the old address after the move.
 - **Behind a PCIe switch:** the layout module refuses the root port of the boot VGA device (and of any BAR with a

@@ -7,21 +7,23 @@ What the boot service does, by hand, on a running system. The example is the ver
 
 1. Stop every GPU user; `fuser -v /dev/nvidia*` must print nothing.
 2. If the card drives the display (`boot_vga` is `1`), detach the console or the unbind hangs:
-   `echo 0 > /sys/class/vtconsole/vtcon1/bind` (the vtcon whose `name` is `(M) frame buffer device`).
+   `echo 0 > /sys/class/vtconsole/vtcon<N>/bind` for the vtcon whose `name` is `(M) frame buffer device` (for example
+   `vtcon1`).
 3. `echo $BDF > /sys/bus/pci/drivers/nvidia/unbind`
-4. `setpci -s $BDF 0x610.L=00000c80:00000f80` (bits 11:7 only: enable plus VAL 9), then check that `0x610` reads
-   `00001c81` and `0xbbc` reads `000ffc00`.
+4. `setpci -s $BDF 0x610.L=00000c80:00000f80` (bits 11:7 only: enable plus VAL 9), then check that `0x610` reads back
+   bits 11:7 as written and `0xbbc` lists every size it listed before plus the target (on the RTX 3080 20GB: `00001c81`
+   and `000ffc00`).
 5. `echo 15 > /sys/bus/pci/devices/$BDF/resource1_resize` (the size index, not bytes).
 6. `echo $BDF > /sys/bus/pci/drivers/nvidia/bind`, then reattach the console if you detached it:
-   `echo 1 > /sys/class/vtconsole/vtcon1/bind`.
+   `echo 1 > /sys/class/vtconsole/vtcon<N>/bind`.
 
 A card whose capability already lists the size skips step 4.
 
 ## Rollback without a reboot
 
-Do steps 1-3. Shrink BAR1 first with `echo 8 > /sys/bus/pci/devices/$BDF/resource1_resize`, and only then disarm
-`0x610` with `setpci -s $BDF 0x610.L=00001001:00000f80`. Rebind the driver and reattach the console. Do not disarm
-`0x610` while BAR1 is still enlarged.
+Do steps 1-3. Shrink BAR1 back to its stock size first (`echo 8 > /sys/bus/pci/devices/$BDF/resource1_resize` for
+256 MiB), and only then disarm `0x610` with `setpci -s $BDF 0x610.L=00000000:00000f80` (bits 11:7 back to 0). Rebind
+the driver and reattach the console. Do not disarm `0x610` while BAR1 is still enlarged.
 
 ## After a device reset
 

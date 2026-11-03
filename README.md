@@ -21,9 +21,9 @@ failure, instability, downtime or voided warranty that results from using it.
 | Verified | RTX 3080 20GB (memory-modded), `10de:2206` subsystem `10de:146d` | 32 GiB BAR1 via `0x610`, two cards on CPU root ports, display card included, warm and cold boots; on driver 615.71.09 and on the NVIDIA vGPU-KVM host driver 580.159.01 with SR-IOV VFs |
 | Untested | every other Turing-or-later GeForce card | enlarged automatically: resized where the card already lists the size, through `0x610` once the structural checks pass, otherwise to the largest size it lists; every write verified and undone on failure; the log marks the card `(untested)` |
 
-Reports and their outcomes: [docs/hardware.md](docs/hardware.md). The boot service works alongside an NVIDIA vGPU host
-with SR-IOV virtual functions (for example [geforce-sriov](https://github.com/noon-at-cgn/geforce-sriov)): it runs
-after the host's SR-IOV preparation unit, and the VFs and vGPU types are unaffected. Cards behind PCIe switches are
+Reports and their outcomes: [docs/hardware.md](docs/hardware.md). On the verified NVIDIA vGPU host with SR-IOV virtual
+functions, the VFs and vGPU types were unaffected; when [geforce-sriov](https://github.com/noon-at-cgn/geforce-sriov) is
+installed, the service runs after its preparation unit (`geforce-sriov-prepare.service`). Cards behind PCIe switches are
 experimental and off by default ([docs/pcie-switches.md](docs/pcie-switches.md)). What was tested, and how to run the
 tests: [docs/testing.md](docs/testing.md).
 
@@ -31,7 +31,8 @@ tests: [docs/testing.md](docs/testing.md).
 
 - Root, `pciutils` (`setpci`, `lspci`), bash and systemd.
 - A kernel that exposes `/sys/bus/pci/devices/<BDF>/resource1_resize`.
-- Above-4G decoding and room in the 64-bit address space for each card's new BAR1 (32 GiB for a 20 GB card).
+- Above-4G decoding and room in the 64-bit address space for each card's new BAR1, aligned to its size (for example
+  32 GiB for a 20 GB card).
 - The NVIDIA driver loads from the root file system, after the service runs (not from the initramfs).
 - The card's VRAM size: recorded automatically once the NVIDIA driver has seen the card, or `size=` in the config.
 - A machine where a GPU or host hang is acceptable while you try it.
@@ -52,14 +53,16 @@ included: its console is blank from the resize at boot until `nvidia-drm` (`fbde
 
 ## Verify
 
+For a 20 GB card, enlarged to a 32 GiB BAR1:
+
 ```sh
 journalctl -b -u geforce-bar1-resize  # "<BDF> armed and resized to 32768 MiB", or "... (resize only, 0x610 untouched)"
 lspci -vv -s <BDF> | grep "Region 1"  # [size=32G]: the real BAR1 size, the check that counts
 sudo geforce-bar1-resize check <BDF>  # PLAN    none: BAR1 already 32768 MiB, skip
 ```
 
-Do not rely on `nvidia-smi` for this: its *BAR1 Total* follows the size the card advertises, so it can show 32768 MiB
-while the real BAR1 is still 256 MiB. Deeper checks: `verify/README.md`.
+Do not rely on `nvidia-smi` for this: on the RTX 3080 20GB its *BAR1 Total* followed the size the card advertises and
+showed 32768 MiB while the real BAR1 was still 256 MiB. Deeper checks: `verify/README.md`.
 
 ## Configuration
 

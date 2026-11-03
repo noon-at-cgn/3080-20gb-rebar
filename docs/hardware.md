@@ -44,7 +44,7 @@ Emulated hardware covers the script's decisions, the verification and restore pa
 - that BAR1 decode follows the new size, and that the driver initialises with a large BAR1 on that family, with and
   without `RMForceStaticBar1=0`;
 - the console handover to `nvidia-drm` on a real GOP framebuffer, and int10h/CSM behaviour on unload;
-- real PCIe switches, e820 and MMIOH limits, and a device reset followed by `repair`.
+- real PCIe switches, firmware e820 reservations and 64-bit MMIO limits, and a device reset followed by `repair`.
 
 ## Help wanted: RTX 4090 / 4090D 48GB (64 GiB BAR1)
 
@@ -67,17 +67,19 @@ lspci -vv -s $BDF | grep 'Region 1'               # note the stock size: 256M is
 setpci -s $BDF 0x60c.L 0x610.L 0xbbc.L 0xdcc.L
 echo $BDF > /sys/bus/pci/drivers/nvidia/unbind
 setpci -s $BDF 0x610.L=00000d00:00000f80          # arm: size field 10 = 64 GiB
-setpci -s $BDF 0x610.L 0xbbc.L                    # go on only if: 00001d01 001ffc00
+setpci -s $BDF 0x610.L 0xbbc.L                    # compare with the first read
 ```
 
-If the last read shows anything else, disarm, rebind and report the output:
+Go on only if `0x610` reads as before except bits 11:7, now enable plus 10 (`0xd00`), and `0xbbc` lists every size it
+listed before plus bit 20 (64 GiB): for example `00001001` and `000ffc00` before give `00001d01 001ffc00`. Otherwise
+disarm, rebind and report the output:
 
 ```sh
 setpci -s $BDF 0x610.L=00000000:00000f80          # disarm: bits 11:7 back to 0
 echo $BDF > /sys/bus/pci/drivers/nvidia/bind
 ```
 
-If it shows `00001d01 001ffc00`, resize, with the driver still unbound (also untested):
+If both read as expected, resize, with the driver still unbound (also untested):
 
 ```sh
 echo 16 > /sys/bus/pci/devices/$BDF/resource1_resize   # 16 = 64 GiB; "No space left" = address window too small
