@@ -6,8 +6,9 @@ path = ["**"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 noon-at-cgn"
 
-# Files that cannot carry a comment.
+# Files that cannot carry a comment, or that are kept exactly as GitHub writes them.
 [[annotations]]
-path = ["LICENSE"]
+path = ["LICENSE", ".github/FUNDING.yml"]
 precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 noon-at-cgn"
 SPDX-License-Identifier = "MIT"

@@ -1060,6 +1060,9 @@ cmd_boot() {
 		local rt=${R_ROUTE[$bdf]} lr=${R_ROUTE[$bdf]}
 		[ "$rt" != none ] || { xve_check "$bdf" >/dev/null 2>&1; S_610_OF[$bdf]=$S_610; [ -n "$S_610" ] && [ $(((0x$S_610 >> 11) & 1)) = 1 ] && lr=0x610; }
 		[ -z "${R_HEAD[$bdf]}" ] || log "$bdf ${P_IDS[$bdf]} ($(label "$bdf" "$lr" "${R_N[$bdf]}")) ${R_HEAD[$bdf]}"
+		card_cfg "$bdf" "${P_IDS[$bdf]}"
+		static_bar1_hint "$bdf" "$(card_keys "$bdf")" "$(bar1_after "$bdf")"
+		[ -z "$W1" ] || { log "$bdf warning: $W1"; log "$bdf $W2"; }
 		if [ "$dry" = 1 ]; then dry_card "$bdf"; else run_card "$bdf"; fi
 		[ -n "${RESULT[$bdf]:-}" ] || RESULT[$bdf]=stock
 		[ "$rt" != none ] || [ "$lr" != 0x610 ] || { RESULT[$bdf]=enlarged; STATE_RT[$bdf]=0x610; }
@@ -1187,6 +1190,8 @@ cmd_check() {
 			on/resize | on/none) echo "  driver  RMForceStaticBar1=0 (driver_option=on)" ;;
 			auto/resize) echo "  driver  static BAR1 kept, no RMForceStaticBar1=0 (resize only; driver_option=on adds it)" ;;
 		esac
+		static_bar1_hint "$bdf" "$(card_keys "$bdf")" "$(bar1_after "$bdf")"
+		[ -z "$W1" ] || printf '  warning %s\n  note    %s\n' "$W1" "$W2"
 		if [ "$SWITCH" = yes ] && [ "$rt" != none ] && [ "$rt" != skip ]; then
 			echo "  note    behind a PCIe switch: the plain resize usually fails with ENOSPC there"
 			echo "  note    LAYOUT=auto (install.sh --layout auto --layout-module) hands it to the layout module (experimental)"
@@ -1338,9 +1343,10 @@ cmd_repair() {
 }
 
 # --- driver option (RMForceStaticBar1=0) ------------------------------------------------------------------------------------
-# user keys per card, in order, a repeated key keeping its last value; our RMForceStaticBar1=0 is not a user key
+# user keys per card, in order, a repeated key keeping its last value. In the option files RMForceStaticBar1=0 is ours,
+# not a user key; in keys= from the config it is the user's (for example after a forced =1 there)
 declare -A UK
-add_keys() { # BDF "K=V;K=V;"
+add_keys() { # BDF "K=V;K=V;" [config]
 	local bdf=$1 t k cur out c
 	local -a toks cs
 	IFS=';' read -r -a toks <<<"$2"
@@ -1348,7 +1354,7 @@ add_keys() { # BDF "K=V;K=V;"
 	for t in "${toks[@]}"; do
 		t=${t//[[:space:]]/}
 		[ -n "$t" ] && [[ $t == *=* ]] || continue
-		[ "$t" != RMForceStaticBar1=0 ] || continue
+		[ "$t" != RMForceStaticBar1=0 ] || [ "${3:-}" = config ] || continue
 		k=${t%%=*}
 		if [[ ";$cur" == *";$k="* ]]; then
 			out=""
@@ -1361,6 +1367,8 @@ add_keys() { # BDF "K=V;K=V;"
 	done
 	UK[$bdf]=$cur
 }
+# RMForceStaticBar1=0 tokens in a group: more in the file than the last write took from keys= means ours is there
+zeros() { local s=";$1" c=0; while [[ $s == *";RMForceStaticBar1=0;"* ]]; do s=${s/;RMForceStaticBar1=0;/;}; c=$((c + 1)); done; echo "$c"; }
 # per-device groups of the NVreg_RegistryDwordsPerDevice lines (not commented out) of a file: "bdf keys" lines
 groups_of() {
 	local f=$1 val t bdf="" keys=""
@@ -1393,6 +1401,74 @@ modprobe_dirs() {
 		echo "$d"
 	done
 }
+# the keys the driver gets for a card: the per-device groups of the modprobe.d lines, then the card's keys= from the
+# config, which driver-option --write applies last (call card_cfg for the card first)
+card_keys() { # BDF
+	local d f b k out=""
+	while IFS= read -r d; do
+		for f in "$d"/*.conf; do
+			[ -e "$f" ] || continue
+			while read -r b k; do [ "$b" != "$1" ] || out+=$k; done < <(groups_of "$f")
+		done
+	done < <(modprobe_dirs)
+	echo "$out$C_KEYS"
+}
+key_last() { # "K=V;..." KEY -> the last value of KEY (the one the driver uses), or nothing
+	local t v=""
+	local -a toks
+	IFS=';' read -r -a toks <<<"$1"
+	for t in "${toks[@]}"; do [ "${t%%=*}" != "$2" ] || v=${t#*=}; done
+	echo "$v"
+}
+dword() { # VALUE -> the number the driver reads from it (simple_strtoul base 0: 0x hex, a leading 0 octal, else decimal)
+	local d=0
+	if [[ $1 =~ ^0[xX]([0-9a-fA-F]+) ]]; then d=$((16#${BASH_REMATCH[1]}))
+	elif [[ $1 =~ ^0([0-7]*) ]]; then d=$((8#0${BASH_REMATCH[1]}))
+	elif [[ $1 =~ ^([0-9]+) ]]; then d=$((10#${BASH_REMATCH[1]})); fi
+	echo $((d & 0xffffffff))
+}
+bar1_after() { # BDF -> BAR1 in MiB after the planned resize, else the current one
+	case ${R_ROUTE[$1]:-} in resize | 0x610) echo $((1 << R_IDX[$1])) ;; *) mib "${P_LEN[$1]:-0}" ;; esac
+}
+# version of the nvidia module the next load uses (modinfo), else of the loaded one, else the one the record saw for
+# the card; empty when unknown. Never nvidia-smi: at boot it would load the driver.
+next_driver() { # BDF
+	local v re='^[0-9]+(\.[0-9]+)+$'
+	v=$(modinfo -F version nvidia 2>/dev/null | head -n 1)
+	[[ $v =~ $re ]] || v=$(awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9.]+$/) { print $i; exit } }' "$NVPROC/version" 2>/dev/null)
+	[[ $v =~ $re ]] || v=${REC_DRV[$1]:-}
+	if [[ $v =~ $re ]]; then echo "$v"; fi
+}
+# A hint, never a decision (no write, route, file or exit status depends on it), for a card with static BAR1 forced
+# (RMForceStaticBar1=1: the last value counts, read as the driver reads a DWORD) and no RMIncreaseRsvdMemorySizeMB,
+# which grows the reserve and so shrinks the mapping. The driver places the static mapping at 512 MiB and checks only
+# that its size fits in BAR1; from driver 610 it reserves less VRAM, so with BAR1 < VRAM + 512 MiB the mapping can run
+# past the end of BAR1. With BAR1 < VRAM it fails on every driver version: remove the key (docs/driver-option.md).
+# Sets W1 and W2, empty when there is nothing to say; at most once per card and run.
+SB_DONE=" "
+static_bar1_hint() { # BDF keys BAR1-MiB
+	local bdf=$1 vram drv
+	W1="" W2=""
+	[[ $SB_DONE != *" $bdf "* ]] && [ "$(dword "$(key_last "$2" RMForceStaticBar1)")" = 1 ] || return 0
+	[ "$(dword "$(key_last "$2" RMIncreaseRsvdMemorySizeMB)")" = 0 ] || return 0
+	if [ -n "$VRAM_ARG" ]; then vram=$VRAM_ARG
+	elif [ -n "${REC_MIB[$bdf]+x}" ] && [ "${REC_IDS[$bdf]}" = "${P_IDS[$bdf]}" ]; then vram=${REC_MIB[$bdf]}
+	else return 0; fi
+	if [ "$3" -lt "$vram" ]; then
+		SB_DONE+="$bdf "
+		W1="RMForceStaticBar1=1 with BAR1 $3 MiB, VRAM $vram MiB: no driver version can initialize the card"
+		W2="forced static BAR1 needs BAR1 >= VRAM; remove RMForceStaticBar1 for this card (docs/driver-option.md)"
+		return 0
+	fi
+	[ "$3" -lt $((vram + 512)) ] || return 0
+	drv=$(next_driver "$bdf")
+	if [ -z "$drv" ]; then drv="driver 610 or later"
+	elif [ "${drv%%.*}" -ge 610 ]; then drv="driver $drv"
+	else return 0; fi
+	SB_DONE+="$bdf "
+	W1="RMForceStaticBar1=1 with BAR1 $3 MiB, VRAM $vram MiB: $drv may fail to initialize the card"
+	W2="the static mapping starts at 512 MiB; add RMIncreaseRsvdMemorySizeMB to its keys= (docs/driver-option.md)"
+}
 cmd_driver_option() {
 	local mode=print adopt=0 quiet=0 bdf line f d enl=() list=() content tmp stamp foreign=() g dv
 	while [ $# -gt 0 ]; do
@@ -1421,13 +1497,22 @@ cmd_driver_option() {
 	if [ -r "$RUN_DIR/cards" ]; then
 		while read -r bdf g line; do [ "$line" != enlarged ] || boot[$bdf]=$g; done <"$RUN_DIR/cards"
 	fi
+	# the keys= the last write took from the config (its "# keys from config:" line)
+	local -A lastk=()
+	local t k
+	local -a toks
+	if line=$(sed -n 's/^# keys from config: //p' "$OPT_FILE" 2>/dev/null) && [ -n "$line" ]; then
+		read -r -a toks <<<"$line"
+		for t in "${toks[@]}"; do bdf=${t%%;*} bdf=${bdf#pci=}; lastk[$bdf]=${t#*;}; done
+	fi
 	# a card listed with our key before (this file, or the old one at migration) whose BAR1 is already at least the
 	# target was enlarged by us (route none): keep it listed, unless another card is there now: the VRAM record holds
 	# that address with other ids, or a record run replaced another card's record there and no rewrite has completed
 	# since ($SWAP_FILE). A card swapped in (for example a stock card whose firmware already gives a large BAR1) does not
-	# inherit the old card's key.
+	# inherit the old card's key. An RMForceStaticBar1=0 that the last write took from keys= is not ours.
 	local -A prev=()
-	while read -r bdf line; do [[ ";$line" != *";RMForceStaticBar1=0;"* ]] || prev[$bdf]=1; done < <(groups_of "$OPT_FILE"; groups_of "$OLD_OPT_READ")
+	while read -r bdf line; do [ "$(zeros "$line")" -le "$(zeros "${lastk[$bdf]:-}")" ] || prev[$bdf]=1; done < <(groups_of "$OPT_FILE")
+	while read -r bdf line; do [ "$(zeros "$line")" = 0 ] || prev[$bdf]=1; done < <(groups_of "$OLD_OPT_READ")
 	# driver_option auto: only cards enlarged through 0x610; resize only and best effort keep the driver's static BAR1
 	# (which some P2P setups need). on: every card with a large BAR1, also one the firmware already gave the target
 	for bdf in "${SCOPE[@]}"; do
@@ -1452,16 +1537,10 @@ cmd_driver_option() {
 			*) [ -z "${boot[$bdf]:-}" ] || { [ "$g" != on ] && [ "${boot[$bdf]}" != 0x610 ]; } || enl+=("$bdf") ;;
 		esac
 	done
-	# keys= from the config now, and the keys= the last write took from the config (its "# keys from config:" line):
-	# a key that came from keys= and is no longer there is dropped; keys added to the file by hand are kept
-	local -A cfgk=() lastk=()
+	# keys= from the config now; a key that the last write took from keys= and is no longer there is dropped; keys
+	# added to the file by hand are kept
+	local -A cfgk=()
 	for bdf in "${SCOPE[@]}"; do card_cfg "$bdf" "${P_IDS[$bdf]}"; [ -z "$C_KEYS" ] || cfgk[$bdf]=$C_KEYS; done
-	local t k
-	local -a toks
-	if line=$(sed -n 's/^# keys from config: //p' "$OPT_FILE" 2>/dev/null) && [ -n "$line" ]; then
-		read -r -a toks <<<"$line"
-		for t in "${toks[@]}"; do bdf=${t%%;*} bdf=${bdf#pci=}; lastk[$bdf]=${t#*;}; done
-	fi
 	while read -r bdf line; do
 		[ -n "$bdf" ] || continue
 		if [ -n "${lastk[$bdf]:-}" ]; then
@@ -1496,21 +1575,41 @@ cmd_driver_option() {
 		for f in "${foreign[@]}"; do while read -r bdf line; do [ -z "$bdf" ] || add_keys "$bdf" "$line"; done < <(groups_of "$f"); done
 	fi
 	# keys= from the config win over the files and the foreign lines (adopted or only shown): apply them again last
-	for bdf in "${!cfgk[@]}"; do add_keys "$bdf" "${cfgk[$bdf]}"; done
+	for bdf in "${!cfgk[@]}"; do add_keys "$bdf" "${cfgk[$bdf]}" config; done
 	for bdf in "${enl[@]}" "${!UK[@]}"; do [ -z "$bdf" ] || [[ " ${list[*]} " == *" $bdf "* ]] || list+=("$bdf"); done
 	mapfile -t list < <(printf '%s\n' "${list[@]}" | sed '/^$/d' | sort)
 	line=""
+	local -a hints=()
+	local -A once=()
 	for bdf in "${list[@]}"; do
-		g="pci=$bdf;"
-		[[ " ${enl[*]} " != *" $bdf "* ]] || g+="RMForceStaticBar1=0;"
-		g+=${UK[$bdf]:-}
+		g="pci=$bdf;" k=${UK[$bdf]:-}
+		# ours and a RMForceStaticBar1=0 that keys= ends at are the same key=value: written once, as ours
+		if [[ " ${enl[*]} " == *" $bdf "* ]]; then
+			g+="RMForceStaticBar1=0;"
+			[[ ";$k" != *";RMForceStaticBar1=0;"* ]] || { k=";$k" once[$bdf]=1; k=${k/;RMForceStaticBar1=0;/;}; k=${k#;}; }
+		fi
+		g+=$k
 		[ "$g" = "pci=$bdf;" ] || line+=$g
+		if [[ " ${SCOPE[*]} " == *" $bdf "* ]]; then
+			static_bar1_hint "$bdf" "${g#"pci=$bdf;"}" "$(bar1_after "$bdf")"
+			[ -z "$W1" ] || hints+=("$bdf warning: $W1" "$bdf $W2")
+		fi
 	done
 	if [ -z "$line" ]; then
 		content=""
 	else
 		local fromcfg=""
-		for bdf in $(printf '%s\n' "${!cfgk[@]}" | sort); do fromcfg+="pci=$bdf;${cfgk[$bdf]} "; done
+		# the keys= of a card with one RMForceStaticBar1=0 for both are recorded without RMForceStaticBar1, so its group
+		# holds one RMForceStaticBar1=0 more than recorded and the next write still finds ours there (prev)
+		for bdf in $(printf '%s\n' "${!cfgk[@]}" | sort); do
+			k=${cfgk[$bdf]}
+			if [ -n "${once[$bdf]:-}" ]; then
+				IFS=';' read -r -a toks <<<"$k"
+				k=""
+				for t in "${toks[@]}"; do [ "${t%%=*}" = RMForceStaticBar1 ] || k+="$t;"; done
+			fi
+			[ -z "$k" ] || fromcfg+="pci=$bdf;$k "
+		done
 		content="# Written by geforce-bar1-resize driver-option. One NVreg_RegistryDwordsPerDevice line for every card: a second
 # line anywhere in modprobe.d would replace this one. RMForceStaticBar1=0 turns off the NVIDIA driver's static BAR1
 # mapping, so host-visible allocations can reach almost all of VRAM (verified on driver $VERIFIED_DRIVER). By default
@@ -1522,6 +1621,7 @@ cmd_driver_option() {
 options nvidia NVreg_RegistryDwordsPerDevice=\"$line\""
 	fi
 	[ ${#line} -le 1000 ] || say "warning: the option line is ${#line} characters; the driver's limit is about 1023"
+	for f in "${hints[@]}"; do say "$f"; done
 	if [ "$mode" = print ]; then
 		if [ -n "$content" ]; then printf '%s\n' "$content"; else echo "no card needs the driver option"; fi
 		for f in "${foreign[@]}"; do foreign_line "$f"; done

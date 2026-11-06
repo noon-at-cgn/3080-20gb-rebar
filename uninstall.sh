@@ -68,9 +68,10 @@ fi
 for f in "${FILES[@]}"; do remove "$f"; done
 
 # --- driver option file -----------------------------------------------------------------------------------------------
-# Every key in it other than our RMForceStaticBar1=0 is the user's (a P2P opt-out, keys= from the config, keys merged
-# from another file by --adopt-driver-line). A line that driver-option commented out in another file is restored;
-# otherwise the user's keys stay in a minimal option file. Only one per-device line takes effect, so never both.
+# Every key in it other than RMForceStaticBar1=0 is the user's (a P2P opt-out, keys= from the config, keys merged from
+# another file by --adopt-driver-line). RMForceStaticBar1=0 is removed as ours, also where the user's keys= put it.
+# A line that driver-option commented out in another file is restored; otherwise the user's keys stay in a minimal
+# option file. Only one per-device line takes effect, so never both.
 MARK='# adopted by geforce-bar1-resize: '
 optvals() { sed -n 's/^[[:space:]]*options[[:space:]]\+nvidia[[:space:]].*NVreg_RegistryDwordsPerDevice="\{0,1\}\([^" ]*\).*/\1/p' "$@"; }
 user_groups() { # NVreg_RegistryDwordsPerDevice values on stdin -> "pci=<address>;K=V;..." per group with keys besides ours

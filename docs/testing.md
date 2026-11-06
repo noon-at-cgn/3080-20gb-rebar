@@ -66,11 +66,11 @@ Not covered on real hardware: a real PCIe switch and chips other than GA102.
 `/sys/bus/pci/devices` tree, a fake `setpci` that keeps config registers in files, and a small `LD_PRELOAD` shim for
 the sysfs behaviour a plain file cannot imitate (resize errors, `drivers_probe`, pending resizes). The scripts run as
 copies in which only `/sys/` and `/proc/iomem` point into the fake tree; no GPU, kernel module or real sysfs file is
-touched. The 95 cases cover discovery, the structural checks, labels, sizing, every route including best effort, the
-dry run, the VRAM record, config precedence and the old `REBAR_*` keys, the driver option per route, the console
-rules, the layout batches and driver hold (with a stand-in `modprobe`), `repair`, `check`, install, uninstall
-(including the driver keys it keeps), the refusal to run without root, the migration from 3080-20gb-rebar (also
-interrupted at every step), and the P2P companion's view of the driver option file.
+touched. The 100 cases cover discovery, the structural checks, labels, sizing, every route including best effort, the
+dry run, the VRAM record, config precedence and the old `REBAR_*` keys, the driver option per route, the static BAR1
+warnings, the console rules, the layout batches and driver hold (with a stand-in `modprobe`), `repair`, `check`,
+install, uninstall (including the driver keys it keeps), the refusal to run without root, the migration from
+3080-20gb-rebar (also interrupted at every step), and the P2P companion's view of the driver option file.
 
 Run it as a normal user (it refuses root) from the repository root:
 

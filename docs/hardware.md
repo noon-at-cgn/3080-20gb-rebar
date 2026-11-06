@@ -17,6 +17,10 @@ A card with no route to its full VRAM size (no GA102-style `0x610` block, for ex
 capability that lists less than VRAM) gets the largest size it lists, if that is above its current BAR1, and the log
 says `below VRAM`; report it with the BAR1 it ended at.
 
+A card whose BAR1 already equals its VRAM and that lists nothing larger (for example the 16 GB RTX 50 cards) has
+nothing to enlarge and is never written. For NVIDIA's own static-BAR1 P2P on such a card with the 610 and 620
+drivers, see [driver-option.md](driver-option.md#static-bar1-on-a-card-whose-bar1-equals-vram).
+
 ## The verified configuration in detail
 
 | Measurement | Result |

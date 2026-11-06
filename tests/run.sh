@@ -19,7 +19,8 @@
 # How the scripts see the fake tree: they run as copies in $WORK/src made with sed 's|/sys/|$FAKE/sys/|g' and
 # 's|/proc/iomem|$FAKE/proc/iomem|g', the only changes (checked by reversing them). $WORK/bin comes first in PATH:
 # setpci is the fake card, `id -u` prints 0, lspci/systemctl/dkms are stubs, nvidia-smi is a fake reading
-# $FAKE/smi, modprobe/modinfo/rmmod/dmesg stand in for the module and the kernel log.
+# $FAKE/smi, modprobe/modinfo/rmmod/dmesg stand in for the module and the kernel log, and `modinfo -F version nvidia`
+# prints $FAKE/nvidia-version (the nvidia module the next load would use; not found without that file).
 # The script runs with LD_PRELOAD=$WORK/bin/standin-open.so for kernel behaviours a plain file cannot give: a write
 # to resource1_resize fails with ENOSPC when resource1_resize.enospc exists next to it and with ENOENT when
 # resource1_resize.enoent exists, writes to drivers_probe append, and reading a `resource` file first applies
@@ -208,6 +209,10 @@ esac
 EOF
 cat >"$BIN/modinfo" <<'EOF'
 #!/bin/sh
+if [ "$*" = "-F version nvidia" ]; then
+	[ -e "$REBAR_FAKE/nvidia-version" ] && exec cat "$REBAR_FAKE/nvidia-version"
+	echo "modinfo: ERROR: Module nvidia not found." >&2; exit 1
+fi
 [ "$1" = gbr_layout ] && [ ! -e "$REBAR_FAKE/no-module" ] || { echo "modinfo: ERROR: Module $1 not found." >&2; exit 1; }
 echo "filename:       /lib/modules/stand-in/updates/dkms/gbr_layout.ko"
 EOF

@@ -811,3 +811,160 @@ c108() {
 	gbr plan; check "plan: bound note" has "$CDIR/out" "$S1 bound to nvidia now; planned as the next boot, before the driver binds$"
 }
 run_case 108-install-bound-switch "install --layout auto with bound cards behind a switch: plan and module" c108
+
+# --- static BAR1 hint (docs/driver-option.md) -------------------------------------------------------------------------
+sb16() { # BDF: a 16 GB Blackwell-like card (RTX 5060 Ti 16 GB ids) whose BAR1 already equals its VRAM (16 GiB)
+	card "$1" layout=gb id=10de:2d04 sub=10de:2d04 bar1=16384 rbbc=0007fc00; vram "$1" 16311
+}
+SB_W1="RMForceStaticBar1=1 with BAR1 16384 MiB, VRAM 16311 MiB: driver"
+SB_W2="the static mapping starts at 512 MiB; add RMIncreaseRsvdMemorySizeMB to its keys= \(docs/driver-option\.md\)$"
+c123() {
+	# forced static BAR1 with BAR1 < VRAM + 512 MiB on driver 610 or later: a warning in plan, boot, check (also
+	# --report) and driver-option, once per card and run, that changes no write, route, option file or exit status.
+	# None with RMIncreaseRsvdMemorySizeMB, without RMForceStaticBar1, with =0, or with room above VRAM (20 GB at 32 GiB)
+	sb16 $A; sb16 $C; sb16 $D; sb16 $E
+	card $B bar1=32768 rbbc=000ffc00; vram $B 20480
+	echo 620.70.06 >"$FAKE/nvidia-version"
+	conf 'declare -A CARD=(' "  [$A]=\"keys=RMForceStaticBar1=1;\"" "  [$B]=\"keys=RMForceStaticBar1=1;\"" \
+		"  [$C]=\"keys=RMForceStaticBar1=1;RMIncreaseRsvdMemorySizeMB=24;\"" "  [$E]=\"keys=RMForceStaticBar1=0;\"" ')'
+	local w="$SB_W1 620\.70\.06 may fail to initialize the card$"
+	local want="pci=$A;RMForceStaticBar1=1;pci=$B;RMForceStaticBar1=1;pci=$C;RMForceStaticBar1=1;RMIncreaseRsvdMemorySizeMB=24;pci=$E;RMForceStaticBar1=0;"
+	boot --dry-run
+	check "plan: warning" has "$CDIR/out" "$A warning: $w"
+	check "plan: the fix" has "$CDIR/out" "$A $SB_W2"
+	boot; check "boot rc 0" eq "$RC" 0
+	check "boot: warning, once" eq "$(grep -c "$A warning: $w" "$CDIR/out")" 1
+	check "boot: the fix" has "$CDIR/out" "$A $SB_W2"
+	check "boot: no other card warned" eq "$(grep -c 'warning: RMForceStaticBar1' "$CDIR/out")" 1
+	check "boot: route none, nothing written" eq "$(count $A writes)/$(count $A resizes)/$(bar_mib $A)" 0/0/16384
+	gbr check; check "check rc 0" eq "$RC" 0
+	check "check: warning" has "$CDIR/out" "^  warning $w"
+	check "check: the fix" has "$CDIR/out" "^  note    $SB_W2"
+	check "check: no other card warned" eq "$(grep -c '^  warning ' "$CDIR/out")" 1
+	gbr check --report $A; check "check --report rc 0" eq "$RC" 0
+	check "check --report: warning" has "$CDIR/out" "^  warning $w"
+	gbr driver-option --print; check "print: warning" has "$CDIR/out" "^$A warning: $w"
+	check "print: the fix" has "$CDIR/out" "^$A $SB_W2"
+	gbr driver-option --write; check "write rc 0" eq "$RC" 0
+	check "write: warning, no other card" eq "$(grep -c "^$A warning: $w" "$CDIR/out")/$(grep -c 'warning: ' "$CDIR/out")" 1/1
+	check "write: file" opt_is "$want"
+	cp "$ROOT/$OPTF" "$CDIR/opt.warned"
+	boot --dry-run; check "plan with the keys in the file too: once" eq "$(grep -c "$A warning: " "$CDIR/out")" 1
+	# the same write without the hint (driver 580): the same file
+	echo 580.105.08 >"$FAKE/nvidia-version"; rm "$ROOT/$OPTF"
+	gbr driver-option --write; check "driver 580: write rc 0, no warning" eq "$RC/$(grep -c 'warning: ' "$CDIR/out")" 0/0
+	check "driver 580: the same file" same_tree "$CDIR/opt.warned" "$ROOT/$OPTF"
+	# driver version: the loaded open module, then the record, else "610 or later"
+	rm "$FAKE/nvidia-version"
+	echo "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  620.70.06  Release Build" >"$FAKE/nv/version"
+	boot --dry-run; check "version from the loaded module" has "$CDIR/out" "$A warning: $w"
+	rm "$FAKE/nv/version"
+	boot --dry-run; check "version from the record" has "$CDIR/out" "$A warning: $SB_W1 615\.71\.09 may fail"
+	sed -i "s|^\($A [^ ]* 16311\) 615\.71\.09 |\1 N/A |" "$ROOT/etc/geforce-bar1-resize/vram"
+	boot --dry-run; check "version unknown" has "$CDIR/out" "$A warning: $SB_W1 610 or later may fail to initialize the card$"
+}
+run_case 123-static-bar1-hint "RMForceStaticBar1=1 on a 16 GB card with BAR1 = VRAM: one warning in plan, boot, check, driver-option; nothing else changes" c123
+
+c124() {
+	# the last RMForceStaticBar1 counts (option file groups, then keys=); keys= =1 then =0 writes =0, so boot, check and
+	# driver-option agree; a driver older than 610 gets no warning
+	sb16 $A; sb16 $B
+	echo 620.70.06 >"$FAKE/nvidia-version"
+	echo "options nvidia NVreg_RegistryDwordsPerDevice=\"pci=$A;RMForceStaticBar1=1;RMForceStaticBar1=0;pci=$B;RMForceStaticBar1=1;\"" >"$ROOT/$OPTF"
+	boot --dry-run
+	check "file =1 then =0: no warning" hasnt "$CDIR/out" "$A warning: "
+	check "file =1: warning" has "$CDIR/out" "$B warning: $SB_W1 620\.70\.06 "
+	gbr check; check "check: file =1 then =0: one warning only (the other card)" eq "$(grep -c '^  warning ' "$CDIR/out")" 1
+	rm "$ROOT/$OPTF"
+	conf 'declare -A CARD=(' "  [$A]=\"keys=RMForceStaticBar1=1;RMForceStaticBar1=0;\"" "  [$B]=\"keys=RMForceStaticBar1=1;\"" ')'
+	boot --dry-run
+	check "keys= =1 then =0: no warning" hasnt "$CDIR/out" "$A warning: "
+	check "keys= =1: warning" has "$CDIR/out" "$B warning: $SB_W1 620\.70\.06 "
+	gbr check; check "check: keys= =1 then =0: one warning only (the other card)" eq "$(grep -c '^  warning ' "$CDIR/out")" 1
+	gbr driver-option --write; check "write rc 0" eq "$RC" 0
+	check "write: keys= =1 then =0 writes =0" opt_is "pci=$A;RMForceStaticBar1=0;pci=$B;RMForceStaticBar1=1;"
+	check "write: warning for the other card only" eq "$(grep -c "^$B warning: " "$CDIR/out")/$(grep -c 'warning: ' "$CDIR/out")" 1/1
+	boot --dry-run; check "plan after the write: no warning for $A" hasnt "$CDIR/out" "$A warning: "
+	gbr check; check "check after the write: one warning only (the other card)" eq "$(grep -c '^  warning ' "$CDIR/out")" 1
+	gbr driver-option --write; check "second write: unchanged" has "$CDIR/out" "^unchanged "
+	conf 'declare -A CARD=(' "  [$B]=\"keys=RMForceStaticBar1=1;\"" ')'
+	gbr driver-option --write; check "keys= removed: the user's =0 goes with it" opt_is "pci=$B;RMForceStaticBar1=1;"
+	echo 580.105.08 >"$FAKE/nvidia-version"
+	boot --dry-run; check "driver 580: no warning" hasnt "$CDIR/out" "warning: "
+	gbr check; check "check, driver 580: no warning" hasnt "$CDIR/out" "^  warning "
+	gbr driver-option --write; check "driver-option, driver 580: no warning" hasnt "$CDIR/out" "warning: "
+}
+run_case 124-static-bar1-hint-last "the last RMForceStaticBar1 counts: keys= =1;=0 writes =0, no warning anywhere; none before driver 610" c124
+
+c125() {
+	# forced static BAR1 on a card whose BAR1 stays below VRAM (skipped at 256 MiB): every driver version fails, so the
+	# warning says to remove the key, also on driver 580; still a hint only. RMIncreaseRsvdMemorySizeMB can reserve the
+	# difference, so with it there is no warning
+	card $A layout=gb; vram $A 20480
+	card $B layout=gb; vram $B 20480
+	echo 580.105.08 >"$FAKE/nvidia-version"
+	conf 'declare -A CARD=(' "  [$A]=\"keys=RMForceStaticBar1=1;\"" "  [$B]=\"keys=RMForceStaticBar1=1;RMIncreaseRsvdMemorySizeMB=0x960;\"" ')'
+	local w1="RMForceStaticBar1=1 with BAR1 256 MiB, VRAM 20480 MiB: no driver version can initialize the card$"
+	local w2="forced static BAR1 needs BAR1 >= VRAM; remove RMForceStaticBar1 for this card \(docs/driver-option\.md\)$"
+	boot --dry-run
+	check "plan: skipped at 256 MiB" has "$CDIR/out" "$A route skip: capability lists up to 256 MiB "
+	check "plan, driver 580: warning" has "$CDIR/out" "$A warning: $w1"
+	check "plan: remove the key" has "$CDIR/out" "$A $w2"
+	check "plan: none with RMIncreaseRsvdMemorySizeMB" hasnt "$CDIR/out" "$B warning: "
+	check "plan: not the RMIncreaseRsvdMemorySizeMB advice" hasnt "$CDIR/out" "add RMIncreaseRsvdMemorySizeMB"
+	gbr check; check "check rc 1 (skip)" eq "$RC" 1
+	check "check: warning" has "$CDIR/out" "^  warning $w1"
+	check "check: remove the key" has "$CDIR/out" "^  note    $w2"
+	check "check: one card only" eq "$(grep -c '^  warning ' "$CDIR/out")" 1
+	gbr driver-option --write; check "write rc 0" eq "$RC" 0
+	check "driver-option: warning, one card only" eq "$(grep -c "^$A warning: $w1" "$CDIR/out")/$(grep -c 'warning: ' "$CDIR/out")" 1/1
+	check "driver-option: remove the key" has "$CDIR/out" "^$A $w2"
+	check "driver-option: the file as without the hint" opt_is "pci=$A;RMForceStaticBar1=1;pci=$B;RMForceStaticBar1=1;RMIncreaseRsvdMemorySizeMB=0x960;"
+	echo 620.70.06 >"$FAKE/nvidia-version"
+	boot --dry-run; check "driver 620: the same warning" has "$CDIR/out" "$A warning: $w1"
+	check "driver 620: none with RMIncreaseRsvdMemorySizeMB" hasnt "$CDIR/out" "$B warning: "
+	check "driver 620: not the RMIncreaseRsvdMemorySizeMB advice" hasnt "$CDIR/out" "add RMIncreaseRsvdMemorySizeMB"
+}
+run_case 125-static-bar1-hint-small "RMForceStaticBar1=1 with BAR1 < VRAM: remove the key, on every driver version; none with RMIncreaseRsvdMemorySizeMB" c125
+
+c126() {
+	# values are read as the driver reads a DWORD (0x hex, a leading 0 octal): 0x1, 01, 0x01 and 0X1 (in the file)
+	# force static BAR1; RMIncreaseRsvdMemorySizeMB=00 is no key, 0x18 and 030 are
+	sb16 $A; sb16 $B; sb16 $C; sb16 $D; sb16 $E
+	echo 620.70.06 >"$FAKE/nvidia-version"
+	echo "options nvidia NVreg_RegistryDwordsPerDevice=\"pci=$E;RMForceStaticBar1=0X1;\"" >"$ROOT/$OPTF"
+	conf 'declare -A CARD=(' "  [$A]=\"keys=RMForceStaticBar1=0x1;\"" "  [$B]=\"keys=RMForceStaticBar1=01;RMIncreaseRsvdMemorySizeMB=00;\"" \
+		"  [$C]=\"keys=RMForceStaticBar1=0x01;RMIncreaseRsvdMemorySizeMB=0x18;\"" "  [$D]=\"keys=RMForceStaticBar1=1;RMIncreaseRsvdMemorySizeMB=030;\"" ')'
+	boot --dry-run
+	check "0x1: warning" has "$CDIR/out" "$A warning: $SB_W1 620\.70\.06 "
+	check "01, RMIncreaseRsvdMemorySizeMB=00: warning" has "$CDIR/out" "$B warning: $SB_W1 620\.70\.06 "
+	check "0X1 in the file: warning" has "$CDIR/out" "$E warning: $SB_W1 620\.70\.06 "
+	check "RMIncreaseRsvdMemorySizeMB=0x18 or 030: none" eq "$(grep -c 'warning: RMForceStaticBar1' "$CDIR/out")" 3
+	gbr check; check "check: the same three" eq "$(grep -c '^  warning ' "$CDIR/out")" 3
+	gbr driver-option --print
+	check "driver-option: the same three" eq "$(grep -cE "^($A|$B|$E) warning: " "$CDIR/out")/$(grep -c 'warning: ' "$CDIR/out")" 3/3
+}
+run_case 126-static-bar1-hint-dword "RMForceStaticBar1 and RMIncreaseRsvdMemorySizeMB read as the driver reads a DWORD" c126
+
+c127() {
+	# ours and a keys= that ends at RMForceStaticBar1=0 give one =0; the # keys from config: line leaves the key out,
+	# so with keys= removed a card listed through the file only (route none) keeps ours. Uninstall removes every =0
+	card $A; vram $A 20480
+	card $B bound=1 layout=plain bar1=32768 rbbc=000ffc00; vram $B 20480
+	echo "options nvidia NVreg_RegistryDwordsPerDevice=\"pci=$B;RMForceStaticBar1=0;\"" >"$ROOT/$OPTF"
+	conf 'declare -A CARD=(' "  [$A]=\"keys=RMForceStaticBar1=0;\"" \
+		"  [$B]=\"keys=RMForceStaticBar1=1;RMForceStaticBar1=0;RMDynBar1P2PEnable=0;\"" ')'
+	gbr driver-option --write; check "write rc 0" eq "$RC" 0
+	check "=0 once per card" opt_is "pci=$A;RMForceStaticBar1=0;pci=$B;RMForceStaticBar1=0;RMDynBar1P2PEnable=0;"
+	check "keys from config: no RMForceStaticBar1" has "$ROOT/$OPTF" "^# keys from config: pci=$B;RMDynBar1P2PEnable=0;$"
+	gbr driver-option --write; check "rewrite: unchanged" has "$CDIR/out" "^unchanged "
+	conf ""
+	gbr driver-option --write; check "keys= removed: ours stays, the P2P key goes" opt_is "pci=$A;RMForceStaticBar1=0;pci=$B;RMForceStaticBar1=0;"
+	# without ours the user's =0 is written and recorded
+	conf 'DRIVER_OPTION=off' 'declare -A CARD=(' "  [$A]=\"keys=RMForceStaticBar1=0;\"" ')'
+	gbr driver-option --write; check "off: the user's =0 only" opt_is "pci=$A;RMForceStaticBar1=0;"
+	check "off: recorded" has "$ROOT/$OPTF" "^# keys from config: pci=$A;RMForceStaticBar1=0;$"
+	uninst; check "uninstall rc 0" eq "$RC" 0
+	check "uninstall: the user's =0 goes too" absent "$ROOT/$OPTF"
+}
+run_case 127-driver-option-once "keys= RMForceStaticBar1=0 on a card with ours: written once; ours kept when keys= goes" c127
